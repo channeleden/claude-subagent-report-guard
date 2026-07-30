@@ -259,13 +259,18 @@ function resolveTeammateContext(payload, { now = Date.now() } = {}) {
       resolutionMethod: 'direct-sibling',
     };
   }
-
   const sessionDir = subagentSessionDir(rawTranscriptPath);
-  if (!sessionDir) return null;
-  const candidates = listTeammateMetaCandidates(path.join(sessionDir, 'subagents'));
-  if (!candidates.length) return null;
+  // sessionDir is only null when rawTranscriptPath itself is unusable for
+  // derivation — nothing further to try either way.
+  const candidates = sessionDir ? listTeammateMetaCandidates(path.join(sessionDir, 'subagents')) : [];
 
-  // Step 2 — explicit agent-identity field on the payload, if present.
+  // Step 2 — explicit agent-identity field on the payload, if present. This
+  // MUST run before the directMeta-non-team short-circuit below, not after
+  // it: checking identity first means a payload that DOES carry a valid
+  // agent_id/agentId can still resolve correctly even when directMeta is a
+  // definitive non-match (a hardening fix — an earlier version of this hook
+  // ran the two checks in the opposite order, which silently suppressed
+  // this identity-field match for any readable non-team sibling).
   const identityFieldCandidates = [
     payload.agent_id,
     payload.agentId,
@@ -276,6 +281,23 @@ function resolveTeammateContext(payload, { now = Date.now() } = {}) {
     const hit = candidates.find((c) => c.agentId === id);
     if (hit) return { ...hit, resolutionMethod: 'payload-identity-field' };
   }
+
+  // A sibling meta.json that was found AND successfully read, but does not
+  // claim team-mailbox membership, is DEFINITIVE negative evidence about
+  // THIS specific calling agent (e.g. a plain Task-tool subagent whose
+  // transcript_path correctly points at its own file). Reached here (after
+  // step 2 above already had its chance to match an explicit identity
+  // field), this must return null rather than fall through to step 3's
+  // session-wide recency heuristic below — that heuristic exists only for
+  // the case where we have NO direct evidence about the caller at all
+  // (directMeta === null, the lead-transcript-path case this hook mainly
+  // targets). Falling through to the blind recency heuristic here would
+  // let an unrelated, fresher team-mailbox candidate elsewhere in the same
+  // session get cross-resolved onto this non-team-mailbox caller —
+  // incorrectly gating a plain subagent as if it were that other teammate.
+  if (directMeta) return null;
+
+  if (!candidates.length) return null;
 
   // Step 3 — recency heuristic, bounded to RECENCY_WINDOW_MS.
   let best = null;
@@ -414,10 +436,21 @@ function buildStage1Reason(finalText) {
     );
   }
 
-  const truncated = finalText.length > MAX_EMBEDDED_REPORT_CHARS;
-  const snippet = truncated ? finalText.slice(0, MAX_EMBEDDED_REPORT_CHARS) : finalText;
+  // `finalText.slice(0, N)` indexes by raw UTF-16 code unit, so it can land
+  // exactly between the two halves of an astral-plane character's
+  // surrogate pair (e.g. many emoji), corrupting the embedded excerpt into
+  // an invalid UTF-16 sequence ending in a lone surrogate — the opposite of
+  // this feature's "reproduced verbatim" premise. `Array.from(str)`
+  // iterates a string by Unicode code point (each entry is one whole
+  // character, surrogate pairs never split), so slicing THAT array is
+  // always code-point-safe. `codePoints.length` then becomes the
+  // "characters" count used everywhere below — identical to `.length` for
+  // ASCII/BMP text; the two only diverge for astral characters.
+  const codePoints = Array.from(finalText);
+  const truncated = codePoints.length > MAX_EMBEDDED_REPORT_CHARS;
+  const snippet = truncated ? codePoints.slice(0, MAX_EMBEDDED_REPORT_CHARS).join('') : finalText;
   const truncationNote = truncated
-    ? `\n\n[...embedded copy truncated at ${MAX_EMBEDDED_REPORT_CHARS} of ${finalText.length} characters. ` +
+    ? `\n\n[...embedded copy truncated at ${MAX_EMBEDDED_REPORT_CHARS} of ${codePoints.length} characters. ` +
       'Your full final message was longer than this excerpt — reproduce your COMPLETE final ' +
       'message from your own last turn, not just the text shown above.]'
     : '';
