@@ -1,0 +1,20 @@
+{
+  "name": "subagent-report-guard",
+  "version": "1.0.0",
+  "description": "Non-blocking lane drop-box for dispatched background/team-mailbox Claude Code teammates: durable checkpoint + heartbeat records so a crashed or stalled lane is detectable even when no one is watching live.",
+  "author": {
+    "name": "Channel Eden",
+    "url": "https://github.com/channeleden"
+  },
+  "homepage": "https://github.com/channeleden/claude-subagent-report-guard",
+  "repository": "https://github.com/channeleden/claude-subagent-report-guard",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "hooks",
+    "subagent",
+    "reliability",
+    "observability",
+    "orchestration"
+  ]
+}

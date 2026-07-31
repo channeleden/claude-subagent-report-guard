@@ -2,9 +2,9 @@
 'use strict';
 
 /**
- * subagent-report-delivery-gate.js — a `SubagentStop` hook for Claude Code
- * that blocks a background/team-mailbox subagent from ending its turn
- * without having called `SendMessage`.
+ * hook.js — a `SubagentStop` hook for Claude Code that blocks a
+ * background/team-mailbox subagent from ending its turn without having
+ * called `SendMessage`.
  *
  * WHY THIS EXISTS
  * ----------------

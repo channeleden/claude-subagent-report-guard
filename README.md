@@ -1,134 +1,152 @@
-# Background-teammate report delivery: mitigation kit
+# Claude Code subagent report guard
 
-Two compounding defects in Claude Code's background/team-mailbox teammate flow, and a
-self-serve mitigation for both:
+Two mitigations for the same underlying problem in Claude Code's
+background/team-mailbox teammate flow: a dispatched teammate can go idle
+without its report ever reaching the dispatcher, and there is no reliable
+way to get it back afterward. Publicly reported and reproduced, independent
+of this repo:
 
-1. **Undelivered final text.** A background teammate's plain final assistant text is never
-   delivered to whoever dispatched it — only an explicit `SendMessage` call delivers content
-   upstream. If a teammate finishes and ends its turn without calling `SendMessage`, the
-   dispatcher receives only a content-free `idle_notification`; the actual report exists solely
-   in that teammate's own transcript file on disk.
-2. **Lossy "recovery."** The standard workaround — ping the idle teammate and ask it to send its
-   report — is not a resend. There is no verbatim-replay primitive on this tool surface:
-   `SendMessage`'s `message` field is authored fresh by the model on every call. Recovering an
-   abandoned report this way has been observed to range from a trivial trim, to a full
-   sentence-level rewrite (facts preserved), to a full structural collapse — an 11-row Markdown
-   table silently became a prose numbered list, with no error or warning. A fluent paraphrase
-   passes review where an obviously-missing report would not. `hook.js` in this kit reduces (but
-   does not structurally eliminate) this risk by extracting the agent's own abandoned text and
-   embedding it directly in the block reason — see "What's in this kit" below.
-3. **A hook payload caveat that defeats the "obvious" fix.** The natural deterministic
-   mitigation is a `SubagentStop` hook that blocks turn-end without a `SendMessage`. Writing
-   that hook the "obvious" way — reading `payload.transcript_path` and checking a sibling
-   `.meta.json` file — silently never fires for named background teammates: on this dispatch
-   shape, `transcript_path` has been observed, live, to resolve to the LEAD session's own
-   top-level transcript, not the teammate's dedicated file. See the comment block at the top of
-   `hook.js` for the full explanation and the three-step resolution this kit uses instead.
+- [anthropics/claude-code#74113](https://github.com/anthropics/claude-code/issues/74113)
+  — "Background agents frequently go idle without delivering their final
+  SendMessage report (re-ping recovers it)"
+- [anthropics/claude-code#76500](https://github.com/anthropics/claude-code/issues/76500)
+  — "Agent Teams mailbox: 5-62 min turn-boundary delays, lost final reports
+  (`idle_notification` arrives instead), `/clear` queue leak, shutdown
+  handshake never completes"
 
-## What's in this kit
+This repo ships two independent mitigations, in two directories:
 
-- **`hook.js`** — a `SubagentStop` hook that blocks a team-mailbox teammate from ending its turn
-  without a well-formed `SendMessage` call, correctly resolving the real per-teammate transcript
-  despite the `transcript_path` caveat above. When it blocks, it extracts the agent's own
-  abandoned final text from its transcript and embeds that text VERBATIM directly inside the
-  block reason — so reproducing it on the agent's next turn is a copy of bytes already in its own
-  context, not a fresh reconstruction from memory. The embed is size-bounded
-  (`MAX_EMBEDDED_REPORT_CHARS`, default 10000 characters, overridable via
-  `SUBAGENT_REPORT_GATE_MAX_EMBEDDED_REPORT_CHARS`); past that bound the reason still includes as
-  much as fits plus an explicit instruction to reproduce the complete original message, not just
-  the shown excerpt. Self-contained (Node built-ins only, no external dependencies).
-- **`extract-report.js`** — a small deterministic CLI that reads a teammate's own transcript file
-  directly off disk and prints its final assistant text verbatim, with zero model involvement.
-  This is the zero-regeneration-risk path — use it when you need the report exactly as written,
-  including any tail past the hook's embed truncation threshold. Also self-contained.
+- **`hooks/` + `lib/`** — the **lane drop-box**: a non-blocking, durable
+  record of every dispatched lane's progress, written out-of-band from
+  `SendMessage` entirely. **Start here** — this is the recommended default.
+- **`legacy-gate/`** — the original **blocking gate**: refuses to let a
+  teammate's turn end without a well-formed `SendMessage` call, with a
+  verbatim-recovery fallback. Documented in its own README as a
+  complementary, alternative approach.
 
-## Installing the hook
+## The problem, in one sentence
 
-Add to your Claude Code `settings.json` (merge into any existing `hooks` object rather than
-replacing it):
+A background teammate's plain final assistant text is never delivered to
+whoever dispatched it — only an explicit `SendMessage` tool call delivers
+content upstream — and if a teammate finishes (or crashes, or gets
+throttled) without calling it, the dispatcher receives only a content-free
+`idle_notification`; the report exists, if at all, only in that teammate's
+own transcript file on disk.
 
-```json
-{
-  "hooks": {
-    "SubagentStop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node /absolute/path/to/hook.js"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+## The doorbell/payload principle
 
-No further configuration is required. The hook fails open on every error path (missing payload,
-unreadable transcript, unwritable state file, ambiguous identity resolution) — it is designed to
-never be the reason a legitimate subagent turn cannot end. It also never gates a plain
-synchronous Task-tool subagent (only team-mailbox participants, identified by
-`taskKind: "in_process_teammate"` in their meta.json, are ever blocked).
+The lane drop-box treats every dispatched lane the same way you'd treat a
+courier: you don't just want to know they rang the doorbell (liveness) —
+you want the package they were carrying (the report), and you want both
+recorded somewhere durable regardless of whether anyone was home to answer.
 
-**Tunables:**
-- `SUBAGENT_REPORT_GATE_RECENCY_WINDOW_MS` (default `600000`, i.e. 10 minutes) bounds how old a
-  candidate teammate transcript can be before the hook's recency-based identity resolution (step
-  3 in `hook.js`'s header comment) will still consider it a match.
-- `SUBAGENT_REPORT_GATE_MAX_EMBEDDED_REPORT_CHARS` (default `10000`) bounds how much of the
-  agent's abandoned text gets embedded verbatim in the block reason (see "What's in this kit"
-  above).
+Two hooks implement this:
 
-## Using the extraction script
+- **`lane-dropbox-checkpoint.js`** (`SubagentStop`) — fires once, at each
+  lane's own natural end-of-turn. Extracts whatever new transcript content
+  appeared and appends a `checkpoint` record carrying the lane's report text
+  verbatim, plus accountability fields (task, worktree, branch, a verified
+  git SHA when available). This is the payload delivery.
+- **`lane-dropbox-heartbeat.js`** (`PostToolUse`) — fires on every tool
+  call, throttled to at most once per 60 seconds per lane. Appends a bare
+  `heartbeat` record with no payload — pure liveness, for a lane that's
+  still working but hasn't stopped yet. This is the doorbell ring alone.
 
-If a background teammate went idle without a `SendMessage` (whether or not you have the hook
-above installed), recover its abandoned report losslessly instead of pinging it:
+Both write to the same append-only, per-lane file:
+`~/.claude/teams/<session_id>/dropbox/<lane_id>.jsonl`. Neither ever blocks
+a turn or a tool call — every failure mode (missing payload, unwritable
+disk, lock contention, ambiguous identity) fails open by design — some
+failure paths also emit a best-effort, single-line stderr diagnostic
+(never required reading, never affects the fail-open behavior itself).
+A skipped record is the acceptable worst case; a wrong one never is.
 
-```sh
-node extract-report.js --session-dir ~/.claude/projects/<your-project-dir>/<session-id> [--agent <teammate-name>]
-```
+## What gets recorded — `lane-record/v1`
 
-`<session-id>` is the directory that directly contains a `subagents/` child. Omit `--agent` to
-get the most recently active teammate under that session; pass it to target a specific one when
-several were dispatched. The script prints that teammate's final assistant text block(s) exactly
-as written, with no model call and no regeneration risk.
+One JSON object per line, one of three `record_type`s:
 
-## If you still need to ping
+| record_type  | written by                     | when                          | carries |
+|--------------|----------------------------------|--------------------------------|---------|
+| `scaffold`   | dispatcher (CLI or direct `require()`) | once, at dispatch time  | provider, task_id, worktree, branch, agent_name / pid+output_log |
+| `checkpoint` | `lane-dropbox-checkpoint.js`   | once per `SubagentStop`       | `report_text` (verbatim), transcript byte-offset range, a `dedupe_key`, `last_verified_sha` |
+| `heartbeat`  | `lane-dropbox-heartbeat.js`    | throttled, ≥60s apart, per `PostToolUse` | `heartbeat_at`, `resolution_method`, `liveness_source` — no report text |
 
-`hook.js` automates the embedded-verbatim-text approach below when it's installed. If you don't
-have it installed, or you're recovering a report from a machine other than the one that ran the
-session (so reading the transcript directly isn't practical), use anti-regeneration wording
-rather than a generic "please send your report" when pinging the idle teammate yourself:
+Every record carries `schema_version` (`lane-record/v1`), `lane_id`,
+`session_id`, `ts`, and `provider` (`claude` \| `codex` \| `gemini` — a
+third-party CLI lane scaffolds itself via the same module's CLI subcommands,
+since it has no Node `require()` boundary of its own). Checkpoint records
+dedupe by transcript byte offset, so a repeat firing with no new content
+writes nothing. Full field-level detail is in the doc comments at the top
+of `lib/lane-dropbox.js`.
 
-> Resend your original report VERBATIM from your own prior turn — do not summarize, re-render,
-> or re-compose it. Copy it exactly.
+## Quickstart
 
-This measurably reduces (though does not structurally eliminate) drift versus a generic
-follow-up prompt, and for any structured deliverable (tables, counts, classifications) you
-should still spot-diff the recovered text against the transcript before acting on it — fluency
-is not fidelity.
+See `INSTALL.md` for the full walkthrough. Short version:
+
+- **Plugin install** — this repo is a valid Claude Code plugin
+  (`.claude-plugin/plugin.json` + `hooks/hooks.json`, using
+  `${CLAUDE_PLUGIN_ROOT}`-relative paths). Point your plugin manager at this
+  repo and enable it.
+- **Manual install** — copy `lib/` and `hooks/` somewhere permanent, then
+  register both hook files in your Claude Code `settings.json` under
+  `SubagentStop` and `PostToolUse`. Exact JSON snippet in `INSTALL.md`.
+
+No build step, no npm dependencies — plain Node.js built-ins only
+(`fs`, `os`, `path`, `crypto`, `child_process`).
+
+## How an orchestrator uses this
+
+1. **At dispatch time**, scaffold the lane — either `require('./lib/lane-dropbox.js').scaffold({...})`
+   from Node, or the CLI (`node lib/lane-dropbox.js scaffold --session <id> --lane-id <id> --provider claude ...`)
+   for a third-party CLI lane. This writes the first record and establishes
+   the lane's file.
+2. **While it runs**, do nothing — the two hooks write checkpoints and
+   heartbeats on their own, with zero orchestrator involvement.
+3. **When a lane goes idle, stalls, or you just want to check in**, read
+   `~/.claude/teams/<session_id>/dropbox/<lane_id>.jsonl` directly. The last
+   `checkpoint` record's `report_text` is that lane's last known report,
+   verbatim, independent of whether `SendMessage` ever actually delivered
+   it. The last `heartbeat_at` across either record type tells you how
+   recently the lane did *anything*, even if it never got as far as a
+   checkpoint.
+
+This is deliberately a plain JSONL file, not a database or a queue — `tail`,
+`jq`, or a one-line `readLaneRecords()` call are all you need to consume it.
+
+## Verification
+
+This mechanism was checked against real multi-lane Claude Code sessions
+before release, not just unit tests against synthetic fixtures — that live
+testing caught a real attribution bug in the heartbeat hook's identity
+resolution (a fast-moving `PostToolUse` firing could get misattributed to a
+lane that had already stopped several seconds earlier); the bug, the fix,
+and the reasoning behind it are documented directly in
+`hooks/lane-dropbox-heartbeat.js`'s own header comment — not smoothed over.
+This repo was also independently reviewed by the `codex` CLI (a different
+model provider than the one that authored it) for publish-safety before
+being pushed public — see `git log` for that review's imprint on this
+history. The exported tree carries 72 tests (`node --test test/*.test.js`),
+covering both hooks and the underlying module: schema/return contracts,
+offset dedupe, lock contention, fail-open paths, the live-evidence-derived
+heartbeat attribution rule, and a portability grep against hardcoded paths.
 
 ## Known limitations
 
-- The hook's recency-based identity resolution (used when no direct-sibling match and no
-  explicit identity field is available) cannot distinguish two teammates that both write to
-  their own transcript within the same tight time window. In a heavily parallel session this can
-  occasionally cause the hook's block/allow decision to be based on the wrong teammate's
-  transcript history. The decision always still applies to whichever agent actually triggered
-  the `SubagentStop` event — what can be wrong, in this narrow case, is which transcript was read
-  to make that call. This is a bounded, occasional-miss risk, not an unbounded one, and is a
-  large net improvement over a hook that (per the caveat above) never gates anything at all on
-  this dispatch shape.
-- Neither script here fixes the underlying platform behavior (undelivered final text, no
-  verbatim-resend primitive, and the `transcript_path` payload mismatch for named background
-  teammates) — they are user-side mitigations, not upstream fixes.
+- Identity resolution's recency-based fallback (used only when no
+  direct-sibling meta.json match and no explicit identity field is
+  available) is a heuristic, not a certainty — see
+  `lib/report-gate-identity.js`'s header for the three-step resolution order
+  and its accepted residual.
+- Neither mitigation here fixes the underlying platform behavior — they are
+  user-side workarounds, not upstream fixes.
+- `legacy-gate/` has its own known limitations — see its own README.
 
 ## Contributing
 
-Found a different failure mode, a cleaner identity-resolution heuristic, or a case where this
-gate's fail-open behavior didn't fail open? Issues and PRs are welcome — this is a small,
-self-contained kit and workarounds from other setups are genuinely useful.
+Found a different failure mode, a cleaner identity-resolution heuristic, or
+a case where a fail-open path didn't actually fail open? Issues and PRs are
+welcome — this is a small, self-contained kit and fixes from other setups
+are genuinely useful.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see `LICENSE`.
