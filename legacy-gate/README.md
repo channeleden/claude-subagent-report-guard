@@ -107,14 +107,19 @@ text against the transcript before acting on it — fluency is not fidelity.
 ## Known limitations
 
 - The hook's recency-based identity resolution (used when no direct-sibling
-  match and no explicit identity field is available) cannot distinguish two
-  teammates that both write to their own transcript within the same tight
-  time window. In a heavily parallel session this can occasionally cause
-  the hook's block/allow decision to be based on the wrong teammate's
-  transcript history. The decision always still applies to whichever agent
-  actually triggered the `SubagentStop` event — what can be wrong, in this
-  narrow case, is which transcript was read to make that call. This is a
-  bounded, occasional-miss risk, not an unbounded one.
+  match and no explicit identity field is available) still cannot
+  distinguish two teammates that both write to their own transcript within
+  the same tight time window by mtime alone — in a heavily parallel session
+  the "most recent" pick can still land on the wrong one. What the hook now
+  does about it: it counts how many teammate transcripts fall inside the
+  recency window at fallback time, and if more than one candidate is
+  in-window (genuinely concurrent lanes), it still blocks the stop — the
+  decision itself doesn't depend on knowing exactly who's calling — but it
+  no longer embeds any transcript's text verbatim in the block reason, since
+  it can no longer be sure whose text that is. It falls back to the generic,
+  non-embedded resend instruction instead. The common case, where exactly
+  one candidate is in the window, is unaffected — that's still resolved and
+  embedded exactly as before.
 - Neither script here fixes the underlying platform behavior (undelivered
   final text, no verbatim-resend primitive, and the `transcript_path`
   payload mismatch for named background teammates) — they are user-side

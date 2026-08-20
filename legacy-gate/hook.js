@@ -75,15 +75,20 @@
  *      earlier in a long session is never silently chosen once the real
  *      signal is genuinely absent.
  *
- * KNOWN LIMITATION of step 3: two teammates that both write within the same
- * tight recency window cannot be told apart by mtime alone — in a heavily
- * parallel session this can occasionally misattribute which teammate's
- * transcript history the block/allow decision is based on. The decision
- * always still applies to whichever agent actually fired the `SubagentStop`
- * event; what can be wrong is which transcript this hook read to make that
- * call. This is a bounded, occasional-miss risk, not an unbounded one, and
- * is a large net improvement over a hook that (per the caveat above) never
- * gates anything at all.
+ * KNOWN LIMITATION of step 3, AND HOW IT'S CONTAINED: two teammates that
+ * both write within the same tight recency window cannot be told apart by
+ * mtime alone — in a heavily parallel session, the "most recent" pick can
+ * still land on the wrong one. The decision always still applies to
+ * whichever agent actually fired the `SubagentStop` event; what can be
+ * wrong is which transcript this hook read to make that call. To keep a
+ * wrong pick from doing real damage, `resolveTeammateContext` also counts
+ * how many candidates fell inside the window (`candidateCount`), and
+ * `main()` only embeds that transcript's text verbatim in the block reason
+ * when the count is exactly 1 — the ordinary case, where there was nothing
+ * else it could have been confused with. With 2+ in-window candidates the
+ * hook still blocks the stop (the decision itself doesn't need certainty
+ * about identity), it just stops short of quoting a possibly-wrong agent's
+ * words back as if they were certainly this one's.
  *
  * THE REGENERATION-DRIFT PROBLEM, AND HOW THIS HOOK REDUCES IT
  * ------------------------------------------------------------------
@@ -152,6 +157,14 @@ const MAX_EMBEDDED_REPORT_CHARS =
 // above. The literal `a` right after `agent-` is part of the harness's own
 // naming scheme, not part of the dispatched agent's own name.
 const AGENT_META_PATTERN = /^agent-a(.+)-([0-9a-f]+)\.meta\.json$/;
+
+// Resolution methods that identify the RIGHT teammate transcript with
+// certainty, as opposed to `recency-heuristic`, which is a best guess among
+// however many candidates happened to be in the window (see step 3 of
+// `resolveTeammateContext` above). Used by `main()` to decide whether it's
+// safe to embed the resolved transcript's text verbatim in the block
+// reason, or whether embedding would risk quoting the wrong lane's report.
+const EXACT_RESOLUTION_METHODS = new Set(['direct-sibling', 'payload-identity-field']);
 
 function allow() {
   process.exit(0);
@@ -299,8 +312,14 @@ function resolveTeammateContext(payload, { now = Date.now() } = {}) {
 
   if (!candidates.length) return null;
 
-  // Step 3 — recency heuristic, bounded to RECENCY_WINDOW_MS.
+  // Step 3 — recency heuristic, bounded to RECENCY_WINDOW_MS. Also tallies
+  // `windowCount`, the number of candidates that land inside the window at
+  // all (not just the winner) — callers use this to tell "only one
+  // plausible teammate" apart from "several teammates were all active at
+  // once and we just guessed the newest one." See `candidateCount` on the
+  // returned object below and its use in `main()`.
   let best = null;
+  let windowCount = 0;
   for (const c of candidates) {
     let mtimeMs;
     try {
@@ -309,9 +328,10 @@ function resolveTeammateContext(payload, { now = Date.now() } = {}) {
       continue;
     }
     if (now - mtimeMs > RECENCY_WINDOW_MS) continue;
+    windowCount += 1;
     if (!best || mtimeMs > best.mtimeMs) best = { ...c, mtimeMs };
   }
-  if (best) return { ...best, resolutionMethod: 'recency-heuristic' };
+  if (best) return { ...best, resolutionMethod: 'recency-heuristic', candidateCount: windowCount };
 
   return null;
 }
@@ -493,7 +513,20 @@ function main() {
   const persisted = writeStateSafe(statePath, { ...state, reportBlockedOnce: true });
   if (!persisted) return allow(); // no durable marker -> fail open, never block
 
-  const finalText = lastAssistantText(entries);
+  // Only embed the resolved transcript's text verbatim when the resolution
+  // that picked it is trustworthy enough to stake a verbatim quote on. Both
+  // exact steps (1 and 2) qualify unconditionally. Step 3's recency guess
+  // qualifies too, but ONLY when it had exactly one in-window candidate to
+  // pick from (`candidateCount === 1`) — the overwhelmingly common shape in
+  // practice, where there is no real ambiguity because nothing else was
+  // even a contender. When two or more teammates were active in the same
+  // window, the guess is genuine and embedding could quote the wrong
+  // agent's report — so `finalText` stays null and `buildStage1Reason`
+  // falls back to its generic, non-embedded instruction instead.
+  const trustedForEmbed =
+    EXACT_RESOLUTION_METHODS.has(resolved.resolutionMethod) ||
+    (resolved.resolutionMethod === 'recency-heuristic' && resolved.candidateCount === 1);
+  const finalText = trustedForEmbed ? lastAssistantText(entries) : null;
   const reason = buildStage1Reason(finalText);
   process.stdout.write(JSON.stringify({ decision: 'block', reason }));
   return allow();
@@ -517,4 +550,5 @@ module.exports = {
   RECENCY_WINDOW_MS,
   MAX_EMBEDDED_REPORT_CHARS,
   AGENT_META_PATTERN,
+  EXACT_RESOLUTION_METHODS,
 };
