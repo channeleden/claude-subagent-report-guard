@@ -124,7 +124,7 @@ and the reasoning behind it are documented directly in
 This repo was also independently reviewed by the `codex` CLI (a different
 model provider than the one that authored it) for publish-safety before
 being pushed public — see `git log` for that review's imprint on this
-history. The exported tree carries 72 tests (`node --test test/*.test.js`),
+history. The exported tree carries 81 tests (`node --test test/*.test.js`),
 covering both hooks and the underlying module: schema/return contracts,
 offset dedupe, lock contention, fail-open paths, the live-evidence-derived
 heartbeat attribution rule, and a portability grep against hardcoded paths.
