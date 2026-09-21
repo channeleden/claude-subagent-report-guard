@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/lane-dropbox-heartbeat.js\""
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/lane-dropbox-heartbeat.sh\""
           }
         ]
       }
