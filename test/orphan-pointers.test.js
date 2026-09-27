@@ -530,6 +530,77 @@ test('SubagentStop hook: malformed/empty stdin never throws, never writes anythi
   assert.equal(out.trim(), '');
 });
 
+// ── `agent_transcript_path` containment validation ──────────────────────
+//
+// Regression coverage for the fix closing a basename-pattern-only accept: a
+// path matching `agent-<id>.jsonl` by NAME alone used to be trusted outright
+// even when it lived outside the session's own `subagents/` dir, or named an
+// id the payload's own `agent_id` disagreed with. All three cases below must
+// fall through to the next resolution step (the `agent_id` + session-dir
+// derivation in step 3) rather than being accepted at step 2 — this repo's
+// fixtures always place the REAL agent transcript at
+// `<subagentsDir>/agent-<agentId>.jsonl` too, so step 3 still finds and
+// writes a pointer for the legitimate cases; only the identity used to GET
+// there differs (confirmed via `resolveAnyAgentContext`'s own
+// `resolutionMethod` below, exported alongside `main`/`harnessAgentId`).
+
+const { resolveAnyAgentContext } = require('../hooks/orphan-pointers-subagent-stop.js');
+
+test('resolveAnyAgentContext: agent_transcript_path OUTSIDE the session\'s subagents dir is rejected at step 2, falls through to step 3', () => {
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_OUTSIDE1' });
+
+  // A sibling directory OUTSIDE `<session dir>/subagents` that happens to
+  // hold a file matching the exact basename pattern `agent-<id>.jsonl` —
+  // the shape a basename-only check would have wrongly trusted.
+  const rogueDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orphan-ptr-rogue-'));
+  const rogueTranscriptPath = path.join(rogueDir, path.basename(transcriptPath));
+  fs.writeFileSync(rogueTranscriptPath, fs.readFileSync(transcriptPath, 'utf8'), 'utf8');
+  fs.writeFileSync(`${rogueTranscriptPath.slice(0, -'.jsonl'.length)}.meta.json`, fs.readFileSync(`${transcriptPath.slice(0, -'.jsonl'.length)}.meta.json`, 'utf8'), 'utf8');
+
+  const payload = realSubagentStopPayload({
+    sessionId, leadTranscriptPath, agentTranscriptPath: rogueTranscriptPath, agentId, lastAssistantMessage: 'x',
+  });
+  const resolved = resolveAnyAgentContext(payload);
+  assert.ok(resolved, 'step 3 (agent_id + session dir derivation) must still resolve the REAL transcript');
+  assert.equal(resolved.resolutionMethod, 'agent-id-derived-path', 'must NOT resolve via the rejected agent-transcript-path step');
+  assert.equal(resolved.transcriptPath, transcriptPath, 'must resolve to the REAL transcript under subagents/, never the rogue one');
+});
+
+test('resolveAnyAgentContext: agent_transcript_path basename disagreeing with payload.agent_id is rejected at step 2', () => {
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { name: 'real', hash: 'aaaa1111', toolUseId: 'toolu_MISMATCH1' });
+  // A second, unrelated agent transcript in the SAME (correct) subagents dir
+  // — dirname containment alone would pass, so this exercises the id-match
+  // check specifically.
+  const { transcriptPath: otherTranscriptPath } = writePlainSubagent(subagentsDir, { name: 'other', hash: 'bbbb2222', toolUseId: 'toolu_OTHER1' });
+
+  const payload = realSubagentStopPayload({
+    sessionId,
+    leadTranscriptPath,
+    agentTranscriptPath: otherTranscriptPath, // path names a DIFFERENT agent...
+    agentId, // ...than the one the payload's own agent_id claims.
+    lastAssistantMessage: 'x',
+  });
+  const resolved = resolveAnyAgentContext(payload);
+  assert.ok(resolved, 'step 3 must still resolve using payload.agent_id, ignoring the mismatched path');
+  assert.equal(resolved.resolutionMethod, 'agent-id-derived-path');
+  assert.equal(resolved.transcriptPath, transcriptPath, 'must resolve to the transcript payload.agent_id actually names, never the mismatched path');
+});
+
+test('resolveAnyAgentContext: a valid real-shape agent_transcript_path payload resolves via step 2, agent id passes isSafePathSegment', () => {
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { name: 'good', hash: 'cccc3333', toolUseId: 'toolu_GOOD1' });
+
+  const payload = realSubagentStopPayload({
+    sessionId, leadTranscriptPath, agentTranscriptPath: transcriptPath, agentId, lastAssistantMessage: 'good report',
+  });
+  const resolved = resolveAnyAgentContext(payload);
+  assert.ok(resolved);
+  assert.equal(resolved.resolutionMethod, 'agent-transcript-path', 'a fully valid real-shape payload must resolve at step 2, not fall through');
+  assert.equal(resolved.transcriptPath, transcriptPath);
+});
+
 // ── integration: a real background-Agent completion, end to end — never
 // surfaced by EITHER hook once genuinely delivered ──────────────────────
 

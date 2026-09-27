@@ -97,18 +97,49 @@ function resolveAnyAgentContext(payload) {
   if (teammate) return teammate;
 
   // Step 2 — the harness naming the stopping agent's own transcript
-  // outright.
+  // outright. Accepted ONLY when ALL of the following hold — a basename
+  // pattern match alone is not enough, since `agent_transcript_path` is a
+  // hook-payload-supplied field and therefore attacker-influenceable, just
+  // like `session_id`/`agent_id`:
+  //   (a) its dirname resolves to EXACTLY `<session dir>/subagents`, where
+  //       `<session dir>` is `payload.transcript_path` with the trailing
+  //       `.jsonl` removed — compared via `path.resolve` on both sides so a
+  //       relative segment or symlink-shaped string can't slip past a naive
+  //       string comparison;
+  //   (b) when `payload.agent_id` is present, the basename equals exactly
+  //       `agent-<agent_id>.jsonl` (no ambiguity between the id the payload
+  //       claims and the id the path implies);
+  //   (c) the id parsed out of the basename passes `isSafePathSegment`.
+  // Any single failure falls through to step 3 (or 4) rather than being
+  // treated as an error — this is a resolution-order preference, not a
+  // validation error path.
   const ownTranscriptPath = nonEmptyString(payload && payload.agent_transcript_path);
-  if (ownTranscriptPath && AGENT_TRANSCRIPT_PATTERN.test(path.basename(ownTranscriptPath))) {
-    const ownMetaPath = metaPathFor(ownTranscriptPath);
-    const ownMeta = ownMetaPath && readJsonSafe(ownMetaPath);
-    if (ownMeta) {
-      return {
-        transcriptPath: ownTranscriptPath,
-        metaPath: ownMetaPath,
-        meta: ownMeta,
-        resolutionMethod: 'agent-transcript-path',
-      };
+  const ownTranscriptMatch = ownTranscriptPath && AGENT_TRANSCRIPT_PATTERN.exec(path.basename(ownTranscriptPath));
+  if (ownTranscriptMatch) {
+    const idFromPath = ownTranscriptMatch[1];
+    const rawTranscriptPathForDir = payload && payload.transcript_path;
+    const sessionDirForCheck = typeof rawTranscriptPathForDir === 'string' && rawTranscriptPathForDir.endsWith('.jsonl')
+      ? rawTranscriptPathForDir.slice(0, -'.jsonl'.length)
+      : (typeof rawTranscriptPathForDir === 'string' ? rawTranscriptPathForDir : null);
+    const expectedDir = sessionDirForCheck && path.resolve(sessionDirForCheck, 'subagents');
+    const actualDir = path.resolve(path.dirname(ownTranscriptPath));
+    const payloadAgentId = nonEmptyString(payload && payload.agent_id);
+
+    const dirOk = Boolean(expectedDir) && actualDir === expectedDir;
+    const idMatchOk = !payloadAgentId || path.basename(ownTranscriptPath) === `agent-${payloadAgentId}.jsonl`;
+    const idSafeOk = isSafePathSegment(idFromPath);
+
+    if (dirOk && idMatchOk && idSafeOk) {
+      const ownMetaPath = metaPathFor(ownTranscriptPath);
+      const ownMeta = ownMetaPath && readJsonSafe(ownMetaPath);
+      if (ownMeta) {
+        return {
+          transcriptPath: ownTranscriptPath,
+          metaPath: ownMetaPath,
+          meta: ownMeta,
+          resolutionMethod: 'agent-transcript-path',
+        };
+      }
     }
   }
 
@@ -224,3 +255,4 @@ function main() {
 if (require.main === module) main();
 
 module.exports = { main, resolveAnyAgentContext, harnessAgentId };
+
