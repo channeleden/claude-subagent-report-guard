@@ -5,6 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const test = require('node:test');
+const { execFileSync } = require('child_process');
 
 function freshPathsModule() {
   delete require.cache[require.resolve('../lib/paths.js')];
@@ -43,21 +44,25 @@ test('dataDir(): CLAUDE_PLUGIN_DATA is used when no override is set', () => {
 // see the "refuses to fall back to the real HOME under the test runner"
 // test below for why a real, un-isolated fallback call is not just
 // untested but actively refused.
-test('dataDir(): falls back to <HOME>/.claude/subagent-report-guard when nothing is set (faked HOME)', () => {
+test('dataDir(): falls back to <HOME>/.claude/subagent-report-guard when nothing is set (faked HOME, NODE_TEST_CONTEXT forced on)', () => {
   const prevOverride = process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
   const prevPluginData = process.env.CLAUDE_PLUGIN_DATA;
   const prevHome = process.env.HOME;
+  const prevTestContext = process.env.NODE_TEST_CONTEXT;
   const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'paths-fallback-home-'));
   delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
   delete process.env.CLAUDE_PLUGIN_DATA;
   process.env.HOME = fakeHome;
+  process.env.NODE_TEST_CONTEXT = '1';
   try {
+    assert.notEqual(fakeHome, os.userInfo().homedir, 'faked HOME must actually differ from the real OS home for this test to prove anything');
     const { dataDir } = freshPathsModule();
     assert.equal(dataDir(), path.join(fakeHome, '.claude', 'subagent-report-guard'));
   } finally {
     if (prevOverride === undefined) delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR; else process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = prevOverride;
     if (prevPluginData === undefined) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = prevPluginData;
     if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevTestContext === undefined) delete process.env.NODE_TEST_CONTEXT; else process.env.NODE_TEST_CONTEXT = prevTestContext;
   }
 });
 
@@ -68,53 +73,87 @@ test('dataDir(): falls back to <HOME>/.claude/subagent-report-guard when nothing
 // override and no faked HOME, so dataDir()'s fallback branch resolved to
 // (and wrote real state files under) the operator's actual
 // ~/.claude/subagent-report-guard. dataDir() now refuses that combination
-// outright whenever node --test's own NODE_TEST_CONTEXT env var is set —
-// see lib/paths.js's own comment for why this can never fire outside a test
-// run. These tests run with the AMBIENT environment `node --test` already
-// gave this process (real NODE_TEST_CONTEXT, real un-faked HOME) — exactly
-// the historical leak condition — so a passing "throws" assertion here IS
-// the proof that condition can no longer write anywhere.
-test('dataDir(): refuses to fall back to the real HOME under the test runner (no override, no faked HOME)', () => {
-  assert.equal(typeof process.env.NODE_TEST_CONTEXT, 'string', 'this test only proves anything while actually running under node --test');
-  const prevOverride = process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
-  const prevPluginData = process.env.CLAUDE_PLUGIN_DATA;
-  delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
-  delete process.env.CLAUDE_PLUGIN_DATA;
-  try {
-    const { dataDir } = freshPathsModule();
-    assert.throws(() => dataDir(), /refusing to fall back to the real home directory/);
-  } finally {
-    if (prevOverride === undefined) delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR; else process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = prevOverride;
-    if (prevPluginData === undefined) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = prevPluginData;
-  }
+// outright whenever node --test's own NODE_TEST_CONTEXT env var is set AND
+// os.homedir() resolves to the real, OS-level home — see lib/paths.js's own
+// comment for why this can never fire outside a test run.
+//
+// This test does NOT rely on the ambient environment `node --test` already
+// gave this process to happen to already be "real NODE_TEST_CONTEXT, real
+// un-faked HOME" — that assumption is false in a sandboxed harness, where
+// the ambient HOME is routinely already something other than
+// os.userInfo().homedir (the real, OS-level home), which would make the
+// guard's own precondition false and this test prove nothing. Instead it
+// spawns an isolated child process with the exact condition the guard is
+// built to catch made EXPLICIT: HOME forced to the real OS home
+// (os.userInfo().homedir, which — unlike os.homedir() — ignores any HOME
+// override and reads the OS user database directly), NODE_TEST_CONTEXT
+// forced on, and both data-dir overrides explicitly unset. A throw from
+// that child is the actual proof the guard fires under its real trigger
+// condition, regardless of what this test file's own ambient env happens
+// to be.
+test('dataDir(): refuses to fall back to the real HOME under the test runner (spawned child, explicit HOME + NODE_TEST_CONTEXT, no override)', () => {
+  const realHome = os.userInfo().homedir;
+  const pathsModulePath = path.join(__dirname, '..', 'lib', 'paths.js');
+  const script = [
+    `const { dataDir } = require(${JSON.stringify(pathsModulePath)});`,
+    'try {',
+    '  dataDir();',
+    "  process.stdout.write('NO_THROW');",
+    '} catch (e) {',
+    "  process.stdout.write('THREW:' + e.message);",
+    '}',
+  ].join('\n');
+
+  const env = { ...process.env, HOME: realHome, NODE_TEST_CONTEXT: '1' };
+  delete env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  delete env.CLAUDE_PLUGIN_DATA;
+
+  const out = execFileSync(process.execPath, ['-e', script], { encoding: 'utf8', env });
+  assert.match(out, /^THREW:/, `expected dataDir() to throw under real HOME + NODE_TEST_CONTEXT, got: ${out}`);
+  assert.match(out, /refusing to fall back to the real home directory/);
 });
 
-test('dataDir(): the guard above does not fire once HOME is faked away from the real one', () => {
+// Explicit about BOTH halves of the guard's own trigger condition
+// (NODE_TEST_CONTEXT set AND os.homedir() === the real OS home): forces
+// NODE_TEST_CONTEXT on itself rather than depending on whatever the ambient
+// test-runner env happens to carry, then fakes HOME away from the real OS
+// home (os.userInfo().homedir) so the guard's SECOND half is false — proving
+// the guard specifically needs BOTH halves, not just NODE_TEST_CONTEXT alone.
+test('dataDir(): the guard above does not fire once HOME is faked away from the real one (NODE_TEST_CONTEXT forced on)', () => {
   const prevOverride = process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
   const prevPluginData = process.env.CLAUDE_PLUGIN_DATA;
   const prevHome = process.env.HOME;
+  const prevTestContext = process.env.NODE_TEST_CONTEXT;
   const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'paths-guard-home-'));
   delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
   delete process.env.CLAUDE_PLUGIN_DATA;
   process.env.HOME = fakeHome;
+  process.env.NODE_TEST_CONTEXT = '1';
   try {
+    assert.notEqual(fakeHome, os.userInfo().homedir, 'faked HOME must actually differ from the real OS home for this test to prove anything');
     const { dataDir } = freshPathsModule();
     assert.doesNotThrow(() => dataDir());
   } finally {
     if (prevOverride === undefined) delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR; else process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = prevOverride;
     if (prevPluginData === undefined) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = prevPluginData;
     if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+    if (prevTestContext === undefined) delete process.env.NODE_TEST_CONTEXT; else process.env.NODE_TEST_CONTEXT = prevTestContext;
   }
 });
 
-test('dataDir(): the guard does not fire once SUBAGENT_REPORT_GUARD_DATA_DIR is set, even with a real HOME', () => {
+// Explicit about NODE_TEST_CONTEXT here too, and about HOME being left at
+// whatever the real OS home is — the override must win regardless of either.
+test('dataDir(): the guard does not fire once SUBAGENT_REPORT_GUARD_DATA_DIR is set, even with a real HOME and NODE_TEST_CONTEXT forced on', () => {
   const prevOverride = process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  const prevTestContext = process.env.NODE_TEST_CONTEXT;
   process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = '/tmp/some-override-dir';
+  process.env.NODE_TEST_CONTEXT = '1';
   try {
     const { dataDir } = freshPathsModule();
     assert.doesNotThrow(() => dataDir());
   } finally {
     if (prevOverride === undefined) delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR; else process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = prevOverride;
+    if (prevTestContext === undefined) delete process.env.NODE_TEST_CONTEXT; else process.env.NODE_TEST_CONTEXT = prevTestContext;
   }
 });
 
