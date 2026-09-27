@@ -58,8 +58,11 @@ function runHook(payload, env = {}) {
   return out;
 }
 
+// Default dropbox root (no override configured) is `<dataDir>/teams`, and
+// dataDir's own fallback is `<HOME>/.claude/subagent-report-guard` — see
+// lib/paths.js.
 function teamDirForHome(home, sessionId) {
-  return path.join(home, '.claude', 'teams', sessionId);
+  return path.join(home, '.claude', 'subagent-report-guard', 'teams', sessionId);
 }
 
 // ── unit: deriveLaneId (same precedence as the checkpoint hook) ─────────
@@ -164,13 +167,12 @@ test('hook wall-clock cost stays comfortably inside a generous CI-safe bound', (
   assert.ok(elapsedMs < 2000, `heartbeat hook subprocess took ${elapsedMs}ms`);
 });
 
-// ── heartbeat resolution rule (live-verification-driven revision) ────────
+// ── heartbeat resolution rule ──────────────────────────────────────────────
 //
-// Fixtures derived directly from live-verification evidence: a lane that
-// stopped 13s earlier must no longer match (it did, live, before this fix —
-// that was the failure this rule closes); a sole genuinely-fresh candidate
-// must still match; two simultaneously-fresh candidates must resolve to
-// ambiguous/null.
+// A lane that stopped seconds earlier must no longer match — that
+// misattribution is the failure this rule closes; a sole genuinely-fresh
+// candidate must still match; two simultaneously-fresh candidates must
+// resolve to ambiguous/null.
 
 test('recencyResolutionIsSafe: sole candidate well within epsilon (200ms fresh) is accepted', () => {
   const { leadTranscriptPath, subagentsDir } = mkSessionFixture();
@@ -285,7 +287,7 @@ test('source guard: this hook file never imports the three forbidden transcript-
   assert.equal(/require\([^)]*child_process/.test(src), false, 'the heartbeat hook must not shell out (e.g. to git)');
 });
 
-test('source guard: no operator-specific hardcoded /Users/<name> path in this hook file', () => {
+test('source guard: no user-specific hardcoded /Users/<name> path in this hook file', () => {
   const src = fs.readFileSync(HOOK, 'utf8');
   assert.equal(/\/Users\/[^/'"` ]+/.test(src), false);
 });

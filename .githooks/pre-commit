@@ -1,0 +1,6 @@
+#!/bin/sh
+# Runs the deterministic hygiene scan before every commit. Enable it once
+# per clone with:
+#   git config core.hooksPath .githooks
+set -e
+node "$(git rev-parse --show-toplevel)/scripts/hygiene-check.js"

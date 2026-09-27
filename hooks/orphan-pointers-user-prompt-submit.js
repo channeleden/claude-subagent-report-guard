@@ -1,0 +1,90 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * hooks/orphan-pointers-user-prompt-submit.js — `UserPromptSubmit` hook,
+ * the orphaned-report pointer mechanism's within-session surfacing side.
+ * For the CURRENT session, surfaces any pointer whose subagent finished
+ * but whose normal delivery cannot be confirmed from transcript evidence
+ * after a grace period. Each pointer is
+ * surfaced at most once via this hook (a persisted flag, not a re-check
+ * every prompt). Never blocking — outputs additionalContext or nothing.
+ *
+ * Fast no-op path: when this plugin has never written a pointer, returns
+ * immediately without touching any transcript.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const {
+  hasAnyPointers,
+  reconcileAndFilter,
+  markSurfaced,
+  formatPointerList,
+  pointersRootDir,
+} = require('../lib/orphan-pointers.js');
+const { subagentSessionDir } = require('../lib/subagent-transcript.js');
+const { isSafePathSegment } = require('../lib/path-safety.js');
+
+function readPayload() {
+  try {
+    const raw = fs.readFileSync('/dev/stdin', 'utf8').trim();
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function sessionIdFromPayload(payload) {
+  if (payload && typeof payload.session_id === 'string' && payload.session_id) return payload.session_id;
+  if (payload && typeof payload.transcript_path === 'string') {
+    const base = path.basename(subagentSessionDir(payload.transcript_path) || '');
+    if (base) return base;
+    // A top-level transcript path for the lead session itself has no
+    // `subagents/` marker to strip past — its own basename minus `.jsonl`
+    // IS the session id.
+    const b2 = path.basename(payload.transcript_path, '.jsonl');
+    if (b2) return b2;
+  }
+  return null;
+}
+
+function main() {
+  try {
+    if (!hasAnyPointers()) return process.exit(0); // empty case: no transcript reads at all
+
+    const payload = readPayload();
+    const sessionId = sessionIdFromPayload(payload);
+    // Same safe-path-segment rule the lane drop-box uses — a session_id of
+    // e.g. "../../etc" must never reach a pointer-dir read. Fail open
+    // (no-op), never throw or attempt the read.
+    if (!sessionId || !isSafePathSegment(sessionId)) return process.exit(0);
+
+    const eligible = reconcileAndFilter(sessionId, 'userPromptSubmit');
+    if (!eligible.length) return process.exit(0);
+
+    // `markSurfaced` returns true only for the entries THIS process actually
+    // claimed (wins an atomic wx-created marker file) — a concurrent
+    // SessionStart/UserPromptSubmit hook racing on the same pointer loses
+    // the claim and is filtered out here, so the same pointer is never
+    // surfaced twice.
+    const claimed = eligible.filter((entry) => markSurfaced(entry, 'userPromptSubmit'));
+    if (!claimed.length) return process.exit(0);
+
+    const additionalContext =
+      `${claimed.length} subagent report${claimed.length === 1 ? '' : 's'} from this session may not have reached you ` +
+      `(normal delivery could not be confirmed):\n${formatPointerList(claimed, pointersRootDir())}`;
+
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext },
+    }));
+  } catch {
+    /* fail open, unconditionally */
+  }
+  process.exit(0);
+}
+
+if (require.main === module) main();
+
+module.exports = { main, sessionIdFromPayload };

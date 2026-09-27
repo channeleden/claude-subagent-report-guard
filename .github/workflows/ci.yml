@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Run tests
+        run: node --test test/*.test.js
+      - name: Hygiene check (working tree)
+        run: node scripts/hygiene-check.js
+      - name: Hygiene check (history report, non-blocking)
+        run: node scripts/hygiene-check.js --history

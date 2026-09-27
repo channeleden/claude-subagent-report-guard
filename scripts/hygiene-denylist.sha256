@@ -1,0 +1,21 @@
+# scripts/hygiene-denylist.sha256
+#
+# One lowercase hex SHA-256 hash per line — never the plaintext term itself.
+# scripts/hygiene-check.js lowercases scanned text, tokenizes it into words
+# (`[a-z0-9]+(?:[-_][a-z0-9]+)*`), forms 2- and 3-word phrases of
+# consecutive words joined by a single space, hashes each token/phrase, and
+# flags a match against this list as rule `private-vocabulary (hashed)`.
+#
+# To add a term: compute its sha256 with
+# node -e "console.log(require('crypto').createHash('sha256').update('your term here'.toLowerCase()).digest('hex'))"
+# and append the hash below. Never commit the plaintext term anywhere in
+# this repo (source, tests, or commit messages).
+bbbf7a6412d6d3e8244ac1fda5e35a20037acee661288cb95b7b18cf469980aa
+510345478efc1edf0c921f97f5b314eb51b4a0347fd85f36845101d3beff1a1d
+2d2449b430ea087a1b2e8a8d13bc8757989906f7f622c0b41e003eedce057beb
+b54d4b20c008c52db25cd96543968aa4cad9e166d02d4a6f23f11e96ae617ccb
+00c80d39649dd7698e17f00ea7ca9751626824d57d5a6616ca69edfabdc55aec
+bae4369d75986ca208ec6cbb9807cf773791ccaf0a330e6386dbf3d5edb0d757
+3110db2754b08e20014f863dcf67aa1be73c028f2168cd22609d612b14a32f9c
+4bd3f5904658ef28b47c024a93372f9d993c6d693d2af8d796c9c7cf532b2612
+13f02f7b5887ad2e8831a96b0c07f3cdfd4dd023e0c65e4e273d409190311ef0

@@ -1,0 +1,15 @@
+{
+  "name": "claude-subagent-report-guard",
+  "description": "Closes a real, reproduced gap in how dispatched Claude Code subagents report back to whoever dispatched them.",
+  "owner": {
+    "name": "Channel Eden",
+    "url": "https://github.com/channeleden"
+  },
+  "plugins": [
+    {
+      "name": "subagent-report-guard",
+      "source": "./",
+      "description": "Blocks a dispatched Claude Code teammate from going idle without delivering its report, keeps a non-blocking drop-box of every lane's progress, and surfaces a pointer to any subagent report that never reached its dispatcher."
+    }
+  ]
+}

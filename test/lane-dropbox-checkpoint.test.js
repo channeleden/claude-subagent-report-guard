@@ -149,7 +149,7 @@ test('hook: missing session_id fails open (never guesses a session directory)', 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-dropbox-checkpoint-home-'));
   const out = runHook({ transcript_path: transcriptPath }, { HOME: home });
   assert.equal(out, '');
-  assert.equal(fs.existsSync(path.join(home, '.claude', 'teams')), false);
+  assert.equal(fs.existsSync(path.join(home, '.claude', 'subagent-report-guard', 'teams')), false);
 });
 
 test('hook: repeat firing with no new transcript content produces zero duplicate checkpoint records', () => {
@@ -183,8 +183,11 @@ test('hook: two concurrently dispatched lanes each get their own <lane_id>.jsonl
   assert.equal(recB.report_text, 'report B');
 });
 
+// Default dropbox root (no override configured) is `<dataDir>/teams`, and
+// dataDir's own fallback is `<HOME>/.claude/subagent-report-guard` — see
+// lib/paths.js.
 function teamDirForHome(home, sessionId) {
-  return path.join(home, '.claude', 'teams', sessionId);
+  return path.join(home, '.claude', 'subagent-report-guard', 'teams', sessionId);
 }
 
 // ── source guards ─────────────────────────────────────────────────────────
@@ -196,7 +199,7 @@ test('source guard: this hook never imports subagent-transcript.js directly (tha
   assert.equal(/require\([^)]*subagent-transcript/.test(src), false);
 });
 
-test('source guard: no operator-specific hardcoded /Users/<name> path in this hook file', () => {
+test('source guard: no user-specific hardcoded /Users/<name> path in this hook file', () => {
   const src = fs.readFileSync(HOOK, 'utf8');
   assert.equal(/\/Users\/[^/'"` ]+/.test(src), false);
 });

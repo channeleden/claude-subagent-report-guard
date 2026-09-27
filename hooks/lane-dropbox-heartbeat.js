@@ -15,15 +15,14 @@
  * from `../lib/report-gate-identity.js`) and the same hook-layer/export-internal
  * split — this file's own logic stops once `touch()` is called.
  *
- * HEARTBEAT RESOLUTION RULE (live-verification-driven revision). A real live
- * multi-lane dispatch proved `resolveTeammateContext`'s `recency-heuristic`
+ * HEARTBEAT RESOLUTION RULE. `resolveTeammateContext`'s `recency-heuristic`
  * path is UNSAFE to trust as-is for `PostToolUse`: it picks the single
  * most-recently-touched team-mailbox candidate SESSION-WIDE, with no way to
  * confirm that candidate is the one whose OWN tool call triggered THIS
- * firing. Live testing showed unrelated tool calls (a different lane's own
- * follow-up work) getting silently misattributed to a lane that had already
- * stopped seconds earlier, because that lane's transcript remained the
- * freshest candidate within the (10-minute) `RECENCY_WINDOW_MS` used inside
+ * firing. An unrelated tool call (a different lane's own follow-up work)
+ * can get silently misattributed to a lane that already stopped seconds
+ * earlier, because that lane's transcript remains the freshest candidate
+ * within the (10-minute) `RECENCY_WINDOW_MS` used inside
  * `resolveTeammateContext` itself. `SubagentStop` (the checkpoint hook) does
  * not share this exposure to the same degree — it fires once, at each
  * lane's own natural end-of-turn moment, when that lane's own file is very
@@ -66,16 +65,15 @@
  * identity-resolution cost on the `recency-heuristic` path (it repeats an
  * equivalent candidate scan) — worth re-measuring if you tune the epsilon.
  *
- * LIVE-WIRING NOTE: `payload.session_id` presence, `PostToolUse` firing for
+ * WIRING NOTE: `payload.session_id` presence, `PostToolUse` firing for
  * subagent tool calls, and `resolveTeammateContext`'s resolution (gated by
- * the epsilon rule above) were all independently confirmed against a REAL
- * live multi-lane `PostToolUse` payload with GENUINELY CONCURRENT active
- * lanes before this hook shipped — sequential-only testing is not
- * sufficient on its own; correct attribution AND refuse-on-ambiguity had to
- * be proven under real concurrency. If you modify the identity-resolution
- * logic this hook depends on, re-verify against a real live payload before
- * trusting the change — unit tests against synthetic fixtures alone missed
- * the exact misattribution this rule exists to close (see above).
+ * the epsilon rule above) must all hold under genuinely concurrent active
+ * lanes, not just sequential ones — correct attribution AND
+ * refuse-on-ambiguity both need to be proven under real concurrency. If you
+ * modify the identity-resolution logic this hook depends on, verify against
+ * a real multi-lane payload before trusting the change — unit tests against
+ * synthetic fixtures alone can miss the misattribution this rule exists to
+ * close (see above).
  *
  * Invariants: ALWAYS exits 0. Never writes a `{decision: ...}` field to
  * stdout. Every failure mode fails open.

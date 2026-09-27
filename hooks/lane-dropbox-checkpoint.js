@@ -8,7 +8,8 @@
  * ../README.md for the full picture). Extracts a stopping lane's
  * newly-appeared transcript content and appends one `checkpoint` record
  * (report text + lane-accountability fields) to that lane's own
- * `~/.claude/teams/<session_id>/dropbox/<lane_id>.jsonl`.
+ * `<data dir>/teams/<session_id>/dropbox/<lane_id>.jsonl` (or the configured
+ * `dropboxRoot`).
  *
  * Identity resolution is entirely delegated to `resolveTeammateContext`
  * (`../lib/report-gate-identity.js`) — the 3-step resolution
@@ -27,7 +28,7 @@
  * Invariants (this hook only, matching the rest of this hooks/ dir):
  *  - ALWAYS exits 0. Never writes a `{decision: ...}` field to stdout — this
  *    hook has nothing to gate; silence on stdout is correct here, not an
- *    oversight (unlike the blocking `legacy-gate/hook.js`, which this hook
+ *    oversight (unlike the blocking `hooks/report-gate.js`, which this hook
  *    does not replace or interact with beyond reusing the same identity
  *    resolution logic).
  *  - Every failure mode fails open — this hook must never be the reason a

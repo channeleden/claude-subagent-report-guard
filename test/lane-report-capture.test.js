@@ -21,6 +21,7 @@ const { execFileSync } = require('child_process');
 
 const {
   scaffold,
+  checkpoint,
   captureReport,
   countReportCaptures,
   readLaneRecords,
@@ -47,8 +48,11 @@ function withHome(home, fn) {
   }
 }
 
+// Default dropbox root (no override configured) is `<dataDir>/teams`, and
+// dataDir's own fallback is `<HOME>/.claude/subagent-report-guard` — see
+// lib/paths.js.
 function laneFilePath(home, sessionId, laneId) {
-  return path.join(home, '.claude', 'teams', sessionId, 'dropbox', `${laneId}.jsonl`);
+  return path.join(home, '.claude', 'subagent-report-guard', 'teams', sessionId, 'dropbox', `${laneId}.jsonl`);
 }
 
 function captureRecords(home, sessionId, laneId) {
@@ -121,11 +125,14 @@ test('never writes the report_delivered fields the checkpoint reader rule owns',
 });
 
 test('defers to an existing delivered-report checkpoint instead of appending a weaker answer', () => {
-  // This repo's checkpoint() (unlike a fuller Claude-only delivery gate)
-  // does not itself parse the transcript for a SendMessage call, so this
-  // constructs the delivered checkpoint record directly — the same
-  // synthetic-record pattern the adjacent REUSED-lane test below uses —
-  // rather than relying on a real checkpoint() call to produce it.
+  // checkpoint() itself now parses the transcript for a well-formed
+  // SendMessage call (terminal-record discrimination — see
+  // lane-dropbox.test.js's own "report_delivered" tests for that
+  // producer-side coverage). This test
+  // constructs the delivered checkpoint record directly anyway, to isolate
+  // captureReport's READER-side behavior from checkpoint()'s own logic; the
+  // companion end-to-end test right below proves the two modules actually
+  // connect through a real checkpoint() call.
   const home = tmpHome();
   withHome(home, () => {
     scaffold({ sessionId: 's', laneId: 'l', provider: 'claude', agentName: 'worker' });
@@ -142,6 +149,28 @@ test('defers to an existing delivered-report checkpoint instead of appending a w
     const result = captureReport({ sessionId: 's', laneId: 'l', terminalReason: 'child-exit:0' });
     assert.deepEqual(result, { written: false, reportAvailable: true, reason: 'already-delivered' });
     assert.equal(captureRecords(home, 's', 'l').length, 0);
+  });
+});
+
+test('end to end: a REAL checkpoint() call with a well-formed SendMessage makes captureReport defer to it', () => {
+  // Proves the producer (checkpoint()'s terminal-record discrimination) and
+  // the reader (captureReport's already-delivered short-circuit) actually
+  // connect, not just each half in isolation.
+  const home = tmpHome();
+  withHome(home, () => {
+    scaffold({ sessionId: 's', laneId: 'l', provider: 'claude', agentName: 'worker' });
+    const transcriptPath = path.join(home, 'transcript.jsonl');
+    fs.writeFileSync(transcriptPath, `${JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', name: 'SendMessage', input: { to: 'main', message: 'the real delivered report' } }] },
+    })}\n`, 'utf8');
+
+    const cpResult = checkpoint({ transcriptPath, sessionId: 's', laneId: 'l', resolutionMethod: 'direct-sibling' });
+    assert.equal(cpResult.written, true);
+
+    const result = captureReport({ sessionId: 's', laneId: 'l', terminalReason: 'child-exit:0' });
+    assert.deepEqual(result, { written: false, reportAvailable: true, reason: 'already-delivered' });
+    assert.equal(captureRecords(home, 's', 'l').length, 0, 'no weaker report-capture record should be appended on top of a real delivered checkpoint');
   });
 });
 
@@ -487,7 +516,7 @@ test('CLI: count-report-captures subcommand reports the current count as { count
 
 // ── Source guards ─────────────────────────────────────────────────────────
 
-test('source guard: no operator-specific hardcoded /Users/<name> path in this repo\'s lane-dropbox.js', () => {
+test('source guard: no user-specific hardcoded /Users/<name> path in this repo\'s lane-dropbox.js', () => {
   const src = fs.readFileSync(MODULE_PATH, 'utf8');
   assert.equal(/\/Users\/[^/'"` ]+/.test(src), false);
 });

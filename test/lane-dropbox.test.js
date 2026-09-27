@@ -27,6 +27,7 @@ const {
   latestScaffoldMeta,
   laneFileFacts,
   writeStateAtomic,
+  isSafePathSegment,
   SCHEMA_VERSION,
   VALID_RESOLUTION_METHODS,
   HEARTBEAT_THROTTLE_MS,
@@ -56,8 +57,11 @@ function withHome(home, fn) {
   }
 }
 
+// Default dropbox root (no override configured) is `<dataDir>/teams`, and
+// dataDir's own fallback (no SUBAGENT_REPORT_GUARD_DATA_DIR/CLAUDE_PLUGIN_DATA
+// set) is `<HOME>/.claude/subagent-report-guard` — see lib/paths.js.
 function laneFilePath(home, sessionId, laneId) {
-  return path.join(home, '.claude', 'teams', sessionId, 'dropbox', `${laneId}.jsonl`);
+  return path.join(home, '.claude', 'subagent-report-guard', 'teams', sessionId, 'dropbox', `${laneId}.jsonl`);
 }
 
 function writeTranscript(p, lines) {
@@ -67,6 +71,16 @@ function writeTranscript(p, lines) {
 
 function assistantText(text) {
   return { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] } };
+}
+
+function sendMessageCall({ to = 'main', message = 'my report', summary } = {}) {
+  const input = { to };
+  if (message !== undefined) input.message = message;
+  if (summary !== undefined) input.summary = summary;
+  return {
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'tool_use', name: 'SendMessage', input }] },
+  };
 }
 
 // Rewrites every `ts`/`heartbeat_at` field in an existing lane dropbox file
@@ -90,9 +104,23 @@ function ageLaneFileTimestamps(laneFile, ageMs) {
 
 // ── teamDirFor / home resolution ────────────────────────────────────────
 
-test('teamDirFor resolves under HOME/.claude/teams/<session>', () => {
+test('teamDirFor resolves under <dataDir>/teams/<session> — self-contained under this plugin\'s own data dir by default', () => {
   withHome('/tmp/fake-home', () => {
-    assert.equal(teamDirFor('sess-1'), path.join('/tmp/fake-home', '.claude', 'teams', 'sess-1'));
+    const prevDataDir = process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+    const prevPluginData = process.env.CLAUDE_PLUGIN_DATA;
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+    delete process.env.CLAUDE_PLUGIN_DATA;
+    try {
+      assert.equal(
+        teamDirFor('sess-1'),
+        path.join('/tmp/fake-home', '.claude', 'subagent-report-guard', 'teams', 'sess-1'),
+      );
+    } finally {
+      if (prevDataDir === undefined) delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+      else process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = prevDataDir;
+      if (prevPluginData === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
+      else process.env.CLAUDE_PLUGIN_DATA = prevPluginData;
+    }
   });
 });
 
@@ -473,6 +501,106 @@ test('checkpoint: writes a schema-complete record, copying forward the scaffold 
     );
     // last_verified_sha is best-effort against a non-git dir — must degrade to null, not throw
     assert.equal(cp.last_verified_sha, null);
+    // Terminal-record discrimination: plain trailing assistant text is
+    // never a delivered report on its own.
+    assert.equal(cp.report_delivered, false);
+    assert.equal(cp.delivered_report_text, null);
+    assert.equal(cp.delivered_report_to, null);
+  });
+});
+
+test('checkpoint: report_delivered/delivered_report_text/delivered_report_to are populated from a well-formed SendMessage call in the window', () => {
+  const home = tmpHome();
+  withHome(home, () => {
+    const transcriptPath = path.join(home, 'transcript-delivered.jsonl');
+    writeTranscript(transcriptPath, [
+      assistantText('working on it...'),
+      sendMessageCall({ to: 'main', message: 'the real delivered report' }),
+    ]);
+    const result = checkpoint({ transcriptPath, sessionId: 'sess-delivered', laneId: 'lane-delivered', resolutionMethod: 'direct-sibling' });
+    assert.equal(result.written, true);
+    const [cp] = readLaneRecords(laneFilePath(home, 'sess-delivered', 'lane-delivered'));
+    assert.equal(cp.report_delivered, true);
+    assert.equal(cp.delivered_report_text, 'the real delivered report');
+    assert.equal(cp.delivered_report_to, 'main');
+    // report_text (the trailing-assistant-text signal) stays independent —
+    // it is the LAST assistant text in the window, not the SendMessage call.
+    assert.notEqual(cp.report_text, cp.delivered_report_text);
+  });
+});
+
+test('checkpoint: falls back to input.summary when input.message is empty, and the LAST well-formed SendMessage call wins', () => {
+  const home = tmpHome();
+  withHome(home, () => {
+    const transcriptPath = path.join(home, 'transcript-lastwins.jsonl');
+    writeTranscript(transcriptPath, [
+      sendMessageCall({ to: 'main', message: 'superseded first report' }),
+      sendMessageCall({ to: 'main', message: '', summary: 'second report via summary only' }),
+    ]);
+    const result = checkpoint({ transcriptPath, sessionId: 'sess-lastwins', laneId: 'lane-lastwins', resolutionMethod: 'direct-sibling' });
+    assert.equal(result.written, true);
+    const [cp] = readLaneRecords(laneFilePath(home, 'sess-lastwins', 'lane-lastwins'));
+    assert.equal(cp.report_delivered, true);
+    assert.equal(cp.delivered_report_text, 'second report via summary only');
+  });
+});
+
+test('checkpoint: a malformed SendMessage call (missing "to") never counts as delivered', () => {
+  const home = tmpHome();
+  withHome(home, () => {
+    const transcriptPath = path.join(home, 'transcript-malformed.jsonl');
+    writeTranscript(transcriptPath, [
+      { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'SendMessage', input: { message: 'no recipient' } }] } },
+    ]);
+    const result = checkpoint({ transcriptPath, sessionId: 'sess-malformed', laneId: 'lane-malformed', resolutionMethod: 'direct-sibling' });
+    assert.equal(result.written, true);
+    const [cp] = readLaneRecords(laneFilePath(home, 'sess-malformed', 'lane-malformed'));
+    assert.equal(cp.report_delivered, false);
+    assert.equal(cp.delivered_report_text, null);
+  });
+});
+
+// ── isSafePathSegment ─────────────────────────────────────────────────────
+
+test('isSafePathSegment: accepts ordinary session/lane id shapes, rejects traversal/slashes/control chars/oversized', () => {
+  assert.equal(isSafePathSegment('session-x'), true);
+  assert.equal(isSafePathSegment('a3a2ad2af148bcfcb'), true);
+  assert.equal(isSafePathSegment('sess.1:2@3'), true);
+  assert.equal(isSafePathSegment('..'), false);
+  assert.equal(isSafePathSegment('.'), false);
+  assert.equal(isSafePathSegment('../escape'), false);
+  assert.equal(isSafePathSegment('has/slash'), false);
+  assert.equal(isSafePathSegment('has\\backslash'), false);
+  assert.equal(isSafePathSegment(' leading-space'), false);
+  assert.equal(isSafePathSegment('trailing-space '), false);
+  assert.equal(isSafePathSegment('control\u0000char'), false);
+  assert.equal(isSafePathSegment(''), false);
+  assert.equal(isSafePathSegment('x'.repeat(241)), false);
+  assert.equal(isSafePathSegment('x'.repeat(240)), true);
+  assert.equal(isSafePathSegment(null), false);
+  assert.equal(isSafePathSegment(undefined), false);
+  assert.equal(isSafePathSegment(42), false);
+});
+
+test('scaffold/checkpoint/touch reject a path-traversal sessionId/laneId rather than escaping the dropbox root', () => {
+  const home = tmpHome();
+  withHome(home, () => {
+    const scaffoldResult = scaffold({ sessionId: '../escape', laneId: 'lane-x', provider: 'claude' });
+    assert.equal(scaffoldResult.written, false);
+    assert.equal(scaffoldResult.reason, 'invalid-args');
+
+    const checkpointResult = checkpoint({
+      transcriptPath: path.join(home, 'x.jsonl'), sessionId: 'sess-x', laneId: '../../escape', resolutionMethod: 'direct-sibling',
+    });
+    assert.equal(checkpointResult.written, false);
+    assert.equal(checkpointResult.reason, 'unresolvable');
+
+    const touchResult = touch({ sessionId: 'sess-x', laneId: '..', resolutionMethod: 'direct-sibling' });
+    assert.equal(touchResult.written, false);
+    assert.equal(touchResult.reason, 'unresolvable');
+
+    // Nothing must exist anywhere outside the ordinary teams/ layout under home.
+    assert.equal(fs.existsSync(path.join(home, 'escape')), false);
   });
 });
 
@@ -796,7 +924,7 @@ test('CLI: an unknown subcommand exits 1 with usage text', () => {
 
 // ── portability ──────────────────────────────────────────────────────────
 
-test('portability: no operator-specific hardcoded /Users/<name> path anywhere in this module', () => {
+test('portability: no user-specific hardcoded /Users/<name> path anywhere in this module', () => {
   const src = fs.readFileSync(MODULE_PATH, 'utf8');
   assert.equal(/\/Users\/[^/'"` ]+/.test(src), false, 'lane-dropbox.js must resolve every path via HOME/os.homedir()/__dirname, never a hardcoded absolute string');
 });

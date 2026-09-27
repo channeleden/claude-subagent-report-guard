@@ -1,10 +1,7 @@
 # Claude Code subagent report guard
 
-Two mitigations for the same underlying problem in Claude Code's
-background/team-mailbox teammate flow: a dispatched teammate can go idle
-without its report ever reaching the dispatcher, and there is no reliable
-way to get it back afterward. Publicly reported and reproduced, independent
-of this repo:
+A Claude Code plugin that closes a real, reproduced gap in how dispatched
+subagents report back:
 
 - [anthropics/claude-code#74113](https://github.com/anthropics/claude-code/issues/74113)
   — "Background agents frequently go idle without delivering their final
@@ -14,219 +11,320 @@ of this repo:
   (`idle_notification` arrives instead), `/clear` queue leak, shutdown
   handshake never completes"
 
-This repo ships two independent mitigations, in two directories:
-
-- **`hooks/` + `lib/`** — the **lane drop-box**: a non-blocking, durable
-  record of every dispatched lane's progress, written out-of-band from
-  `SendMessage` entirely. **Start here** — this is the recommended default.
-- **`legacy-gate/`** — the original **blocking gate**: refuses to let a
-  teammate's turn end without a well-formed `SendMessage` call, with a
-  verbatim-recovery fallback. Documented in its own README as a
-  complementary, alternative approach.
+**This plugin is Claude-Code-specific by nature.** Everything here depends
+on the exact hook events, on-disk transcript layout, and JSONL entry shapes
+this particular harness writes — it is not a portable pattern for other
+agent surfaces.
 
 ## The problem, in one sentence
 
-A background teammate's plain final assistant text is never delivered to
-whoever dispatched it — only an explicit `SendMessage` tool call delivers
-content upstream — and if a teammate finishes (or crashes, or gets
-throttled) without calling it, the dispatcher receives only a content-free
-`idle_notification`; the report exists, if at all, only in that teammate's
-own transcript file on disk.
+A background "team-mailbox" teammate's plain final assistant text is never
+delivered to whoever dispatched it — only an explicit `SendMessage` tool
+call delivers content upstream — and if a teammate finishes (or crashes, or
+gets throttled) without calling it, the dispatcher receives only a
+content-free idle notification; the report exists, if at all, only in that
+teammate's own transcript file on disk.
 
-## The doorbell/payload principle
+## What this plugin does
 
-The lane drop-box treats every dispatched lane the same way you'd treat a
-courier: you don't just want to know they rang the doorbell (liveness) —
-you want the package they were carrying (the report), and you want both
-recorded somewhere durable regardless of whether anyone was home to answer.
+Three independent, composable mechanisms, all shipped as first-class plugin
+hooks (wired only through `hooks/hooks.json`, nothing else):
 
-Two hooks implement this:
+| Mechanism | Hook event(s) | What it does |
+|---|---|---|
+| **Report gate** (`hooks/report-gate.js`) | `SubagentStop` | **Blocks** a team-mailbox teammate's turn from ending until it has sent a well-formed `SendMessage`, once. Embeds the agent's own abandoned final text verbatim in the block reason so resending is a copy, not a regeneration. Also re-checks a delivered report for staleness; that re-check can block again, but only for a genuinely new follow-up message, never the same one twice. Never gates a plain (non-team-mailbox) subagent. |
+| **Lane drop-box** (`hooks/lane-dropbox-checkpoint.js`, `hooks/lane-dropbox-heartbeat.js`) | `SubagentStop`, `PostToolUse` | **Non-blocking** durable record of every dispatched lane's progress — a `checkpoint` with the report text verbatim at each stop, a throttled `heartbeat` on every tool call — written independently of whether `SendMessage` ever succeeds. |
+| **Orphaned-report pointers** (`hooks/orphan-pointers-*.js`) | `SubagentStop`, `UserPromptSubmit`, `SessionStart` | A **fallback safety net**, not a replacement for normal delivery. Records, for every finished subagent, a pointer plus a short excerpt (at most 200 characters) of the subagent's final message, never the full report — the full report stays in the transcript the harness already keeps; later, deterministically checks the parent transcript for evidence of normal delivery, and only if that evidence is absent does it surface a short pointer list. |
 
-- **`lane-dropbox-checkpoint.js`** (`SubagentStop`) — fires once, at each
-  lane's own natural end-of-turn. Extracts whatever new transcript content
-  appeared and appends a `checkpoint` record carrying the lane's report text
-  verbatim, plus accountability fields (task, worktree, branch, a verified
-  git SHA when available). This is the payload delivery.
-- **`lane-dropbox-heartbeat.js`** (`PostToolUse`) — fires on every tool
-  call, throttled to at most once per 60 seconds per lane. Appends a bare
-  `heartbeat` record with no payload — pure liveness, for a lane that's
-  still working but hasn't stopped yet. This is the doorbell ring alone.
+All three fail open by design: every failure mode (missing payload,
+unreadable transcript, unwritable state file, ambiguous identity
+resolution) is swallowed, logged best-effort, and treated as "allow" —
+installing this plugin is never the reason a legitimate subagent turn can't
+end or a tool call can't complete.
 
-Both write to the same append-only, per-lane file:
-`~/.claude/teams/<session_id>/dropbox/<lane_id>.jsonl`. Neither ever blocks
-a turn or a tool call — every failure mode (missing payload, unwritable
-disk, lock contention, ambiguous identity) fails open by design — some
-failure paths also emit a best-effort, single-line stderr diagnostic
-(never required reading, never affects the fail-open behavior itself).
-A skipped record is the acceptable worst case; a wrong one never is.
+### Report gate — the details
 
-## What gets recorded — `lane-record/v1`
+`resolveTeammateContext` identifies the real per-teammate transcript with a
+four-step, decreasing-certainty fallback (an explicit harness-supplied
+path, a direct sibling `.meta.json`, an explicit identity field, then a
+bounded recency heuristic among candidates in the session's `subagents/`
+directory) — see the header comment in `lib/report-gate.js` for the full
+mechanism and the live-observed `transcript_path` mismatch this exists to
+work around.
 
-One JSON object per line, one of four `record_type`s:
+**What the report gate includes, and what it deliberately leaves out:**
 
-| record_type      | written by                     | when                          | carries |
-|-------------------|----------------------------------|--------------------------------|---------|
-| `scaffold`        | orchestrator (CLI or direct `require()`) | once, at dispatch time  | provider, task_id, worktree, branch, agent_name / pid+output_log |
-| `checkpoint`       | `lane-dropbox-checkpoint.js`   | once per `SubagentStop`       | `report_text` (verbatim), transcript byte-offset range, a `dedupe_key`, `last_verified_sha` |
-| `heartbeat`        | `lane-dropbox-heartbeat.js`    | throttled, ≥60s apart, per `PostToolUse` | `heartbeat_at`, `resolution_method`, `liveness_source` — no report text |
-| `report-capture`   | orchestrator (CLI or direct `require()`, via `captureReport()`) | once, on a third-party lane's termination | `report_text` (best-effort tail of `--output-log`), `run_id`, `output_log_sha256`, `terminal_reason` |
+- **Included** — a background-vs-foreground spawn-ledger correlation
+  (`lib/spawn-ledger.js`'s `classifyBackgroundSpawn` /
+  `findBackgroundAgentSpawn`): correlates the stopping teammate back to the
+  parent's own `Agent` tool_use call and reads that call's
+  `run_in_background` input as a three-valued verdict —
+  `confirmed`/`contradicted`/`unknown` — rather than a boolean, because an
+  ABSENT flag is the harness's own default (background) and must not be
+  read as a contradiction. Only an explicit `run_in_background: false`
+  (`contradicted`) suppresses gating.
+- **Included** — a peer-acknowledgment-aware stale-report check
+  (`lib/pending-followup.js`'s `evaluatePendingFollowup`, plus this file's
+  own `lastReportableBoundary`): blocks when a teammate follow-up was
+  delivered after the agent's latest `SendMessage`, while exempting a
+  message the SENDER explicitly marked as needing no reply (a
+  `terminal="true"` envelope attribute or an in-body `[[terminal]]` token)
+  from that comparison — closing an infinite loop two peer-acking agents
+  would otherwise create by re-triggering each other's gate on every ack.
+  See each module's header for the full mechanism and the loop-safety
+  argument for why this check cannot itself introduce an unbounded loop.
+- **Left out** — any nudge toward a specific post-report command or
+  follow-up automation after a report is confirmed sent. Replaced by the
+  generic, off-by-default `postReportCommand` hook below, which has no
+  opinion on what, if anything, should happen next.
 
-Every record carries `schema_version` (`lane-record/v1`), `lane_id`,
-`session_id`, `ts`, and `provider` (`claude` \| `codex` \| `gemini` — a
-third-party CLI lane scaffolds itself via the same module's CLI subcommands,
-since it has no Node `require()` boundary of its own). Checkpoint records
-dedupe by transcript byte offset, so a repeat firing with no new content
-writes nothing. Full field-level detail is in the doc comments at the top
-of `lib/lane-dropbox.js`.
+### Lane drop-box — the details
 
-### `report-capture` — terminal evidence for a lane with no hook available to it
+Two hooks write append-only JSONL records to
+`<data dir>/teams/<session_id>/dropbox/<lane_id>.jsonl` by default —
+INSIDE this plugin's own data dir, so uninstalling stays a one-directory
+delete with zero configuration (see "Where state lives" and the
+`dropboxRoot` option below for pointing this at a shared directory
+instead):
 
-`checkpoint`/`heartbeat` above are Claude-shaped: they fire off a Claude
-Code hook event (`SubagentStop`/`PostToolUse`) against a Claude in-process
-teammate's own JSONL transcript. Neither exists for a third-party CLI lane
-(`codex exec`/`gemini`, spawned by your own orchestrator) — by the time any
-hook could fire, that process has already exited, and there's no transcript
-in this repo's format to parse.
+- **`lane-dropbox-checkpoint.js`** (`SubagentStop`) — once per stop, a
+  `checkpoint` record with the lane's report text verbatim plus
+  accountability fields (task, worktree, branch, a verified git SHA when
+  available). Also carries `report_delivered` / `delivered_report_text` /
+  `delivered_report_to`: the trailing assistant text is exactly backwards as
+  a "was this delivered" signal (a lane that delivers correctly usually
+  trails off with a preamble, while a lane that fails leaves the real
+  report sitting there), so a well-formed `SendMessage` call's own payload
+  is captured separately — the last one in the checkpoint's window wins.
+- **`lane-dropbox-heartbeat.js`** (`PostToolUse`, with a POSIX `sh`
+  prefilter so the common no-active-lanes case never even spawns node) — a
+  throttled (≥60s apart), payload-free `heartbeat` record — pure liveness.
 
-`captureReport({ sessionId, laneId, terminalReason, runId })` closes that
-gap: call it yourself, once, on every third-party lane's termination path
-(normal exit, timeout, spawn error), after the child has exited and its
-`--output-log` is final. It reads the last chunk of that log (capped at
-20,000 characters, always trimmed to a whole line) and appends one
-`report-capture` record — durable, best-effort evidence of what the lane
-was doing when it stopped, independent of whether it ever produced a
-structured report. A companion read-only helper, `countReportCaptures()`,
-returns how many `report-capture` records already exist for a lane
-*before* a new dispatch — call it immediately before a re-dispatch under a
-reused `lane_id` and keep the result as an `after:<N>` baseline, then treat
-"the count grew past N" (not bare presence) as your signal that the new
-run actually finished; bare presence is satisfied instantly by a prior
-run's own leftover record and gives the wrong answer on a retried lane.
+`sessionId`/`laneId` are validated as safe, single path segments (no
+slash, dot-traversal, control characters, or unbounded length) before
+either is interpolated into a filesystem path; an unsafe value is treated
+as a caller-contract violation, mapped to this module's existing closed
+`'invalid-args'`/`'unresolvable'` reason enum, never a thrown exception.
 
-Passing `runId` (any string unique to that one dispatch) matters: a repeat
-`captureReport()` call for the *same* `runId` is recognized as a duplicate
-report of the same run and appends nothing new, while two calls with
-*different* `runId`s always append as two distinct runs — even when their
-captured tails happen to be byte-identical (a tool legitimately reporting
-the same final line twice, or a same-length/different-content coincidence
-across a re-dispatch). Idempotence is keyed on run identity, never on
-content or byte size — a content/size-based dedupe can silently swallow a
-second run's genuinely-new terminal record on a reused lane id, which is
-exactly the failure mode an `after:<N>` poll exists to detect.
+**Left out:** any claim/provider-roster machinery that would notify a
+cross-project ownership tracker. This plugin ships its own, simpler,
+already-existing equivalent instead — `attemptClaimProbe()`, a pluggable
+extension point that is a complete no-op unless you drop a
+`lib/claim-emitter.js` module of your own next to it — rather than
+depending on a provider roster this public plugin has no way to validate
+against.
 
-Both functions are also available from the CLI, for an orchestrator with
-no Node `require()` boundary of its own:
+Read a lane's file directly (`tail`, `jq`, or the module's own
+`readLaneRecords()`) any time you want to check in on it — no database, no
+queue.
+
+### Orphaned-report pointers — the details
+
+**Normal delivery is untouched.** When the parent session is alive, Claude
+Code injects a dispatched subagent's result automatically — a
+`task-notification` for a background dispatch, a `tool_result` for a
+foreground/synchronous one, or a `<teammate-message>`/`<agent-message>` for
+a `SendMessage`. This mechanism never intercepts any of that.
+
+On every `SubagentStop`, a small pointer is written for **every** finished
+subagent (team-mailbox or plain). It stores a pointer plus a short excerpt
+(at most 200 characters) of the subagent's final message, never the full
+report — the full report stays in the transcript the harness already keeps:
+
+```json
+{
+  "transcriptPath": "...", "agentId": "...", "agentName": "...",
+  "parentSessionId": "...", "finishedAt": "...", "summary": "<=200 chars",
+  "claimed": false,
+  "surfaced": { "userPromptSubmit": false, "sessionStart": false }
+}
+```
+
+Before ever surfacing a pointer, delivery is checked deterministically —
+a bounded tail-read (2 MB cap) of the parent's own transcript, matched
+against the real evidence shapes documented in `lib/orphan-pointers.js`'s
+header (a `tool_use_id` match for a foreground dispatch's sidecar-recorded
+`toolUseId`, or an `<agent-message from="...">` / `<teammate-message
+teammate_id="...">` / `task-notification` marker for a team-mailbox one).
+If found, the pointer is marked `claimed` and never surfaced.
+
+- **`UserPromptSubmit`** — surfaces any of THIS session's unclaimed,
+  undelivered pointers as `additionalContext`, once per pointer.
+- **`SessionStart`** — surfaces unclaimed, undelivered pointers left behind
+  by a prior/dead session (the parent's own transcript has gone quiet past
+  a grace period, or the current session id differs from the pointer's
+  recorded parent), once per pointer.
+
+Both surfacing hooks cap the list at 5 items (`+N more at <pointers dir>`)
+and are a fast, transcript-read-free no-op whenever no pointer has ever
+been written. Pointers older than 7 days are pruned opportunistically. This
+mechanism shares no code and no state with any other subagent-observability
+tooling you may have installed alongside this plugin.
+
+## Install
+
+This repo is its own marketplace (`.claude-plugin/marketplace.json`) — no
+external marketplace wrapper needed:
 
 ```
-node lib/lane-dropbox.js capture-report --session <id> --lane-id <id> \
-  [--terminal-reason <reason>] [--run-id <id>]
-node lib/lane-dropbox.js count-report-captures --session <id> --lane-id <id>
+/plugin marketplace add channeleden/claude-subagent-report-guard
+/plugin install subagent-report-guard@claude-subagent-report-guard
 ```
 
-`report-capture` never writes the `report_delivered`/`delivered_report_text`
-fields the checkpoint hook owns — those mean "this Claude lane called
-SendMessage with a well-formed payload," a stronger and more specific claim
-than "here is a scraped log tail." A reader combining both mechanisms
-should prefer an explicitly delivered checkpoint first, and fall back to
-the last available `report-capture` only when no delivered checkpoint
-exists — see the full reader-order rule in `lib/lane-dropbox.js`'s own
-`captureReport` doc comment.
+That's it — every hook is wired via `hooks/hooks.json` (using
+`${CLAUDE_PLUGIN_ROOT}`, never a hand-edited absolute path), and every
+directory this plugin ever writes to is created lazily on first use. No
+`settings.json` edit, no symlink, no copy step, anywhere.
 
-## Quickstart
+## Configuration
 
-See `INSTALL.md` for the full walkthrough. Short version:
+Everything is optional; every default is sensible with zero configuration.
 
-- **Plugin install** — this repo is a valid Claude Code plugin
-  (`.claude-plugin/plugin.json` + `hooks/hooks.json`, using
-  `${CLAUDE_PLUGIN_ROOT}`-relative paths). Point your plugin manager at this
-  repo and enable it.
-- **Manual install** — copy `lib/` and `hooks/` somewhere permanent, then
-  register both hook files in your Claude Code `settings.json` under
-  `SubagentStop` and `PostToolUse`. Exact JSON snippet in `INSTALL.md`.
+### Environment variables
 
-No build step, no npm dependencies — plain Node.js built-ins only
-(`fs`, `os`, `path`, `crypto`, `child_process`).
+| Variable | Default | Read by | Notes |
+|---|---|---|---|
+| `SUBAGENT_REPORT_GUARD_POST_REPORT_COMMAND` | unset (no-op) | `lib/post-report-command.js` | Shell command to run once a team-mailbox report is confirmed delivered. Same effect as `{ "postReportCommand": "..." }` in `<data dir>/config.json`; the env var wins if both are set. |
+| `SUBAGENT_REPORT_GUARD_RECENCY_WINDOW_MS` | `600000` (10 min) | `lib/report-gate.js` | Bounds how old a candidate teammate transcript can be before the report gate's recency-based identity fallback still considers it a match. |
+| `SUBAGENT_REPORT_GATE_RECENCY_WINDOW_MS` | — | `lib/report-gate-identity.js` | **Deprecated alias** of `SUBAGENT_REPORT_GUARD_RECENCY_WINDOW_MS` for the lane drop-box's own identity resolution; still read as a fallback if set, but new configuration should use the `_GUARD_` name. |
+| `SUBAGENT_REPORT_GUARD_AMBIGUITY_EPSILON_MS` | `500` | `lib/report-gate.js` | How close two candidates' mtimes must be before the report gate refuses to pick one (falls back to the generic, non-embedded block reason instead of risking a verbatim quote from the wrong lane). |
+| `SUBAGENT_REPORT_GUARD_MAX_EMBEDDED_REPORT_CHARS` | `10000` | `lib/report-gate.js` | Size bound for the verbatim copy embedded in a block reason. |
+| `SUBAGENT_REPORT_GUARD_LOG_MAX_BYTES` | `2097152` (2 MB) | `lib/log-rotation.js` | Size-capped rotation threshold for this plugin's append-only logs. |
+| `SUBAGENT_REPORT_GUARD_LOG_PATH` | `<data dir>/logs/report-gate-invocations.log` | `hooks/report-gate.js` | Override the report gate's invocation log path. |
+| `SUBAGENT_REPORT_GUARD_TAIL_SCAN_BYTES` | `2097152` (2 MB) | `lib/orphan-pointers.js` | Cap on the bounded tail-read of the parent transcript used to check for delivery evidence. |
+| `SUBAGENT_REPORT_GUARD_PARENT_GONE_GRACE_MS` | `600000` (10 min) | `lib/orphan-pointers.js` | Grace period before a quiet parent transcript is treated as a dead/prior session for cross-session pointer surfacing. |
+| `SUBAGENT_REPORT_GUARD_DROPBOX_ROOT` | unset | `lib/paths.js` | Same effect as `{ "dropboxRoot": "~/some/path" }` in `<data dir>/config.json`; the env var wins if both are set. See the `dropboxRoot` details below. |
+| `SUBAGENT_REPORT_GUARD_DATA_DIR` | unset | `lib/paths.js` | Override this plugin's data dir entirely. **Test-only** — used by this repo's own tests; a real install should not need it. |
+| `CLAUDE_PLUGIN_DATA` | unset | `lib/paths.js` | Set by the Claude Code harness itself (not this plugin) on builds that support it; used as the data dir when `SUBAGENT_REPORT_GUARD_DATA_DIR` is unset. |
+| `LANE_DROPBOX_CLAIM_EMITTER_PATH` | resolves to `lib/claim-emitter.js` next to `lane-dropbox.js` | `lib/lane-dropbox.js` | **Test-only** seam for overriding the optional claim-emitter module path in tests; a real install should not need it. |
+| `SUBAGENT_REPORT_GUARD_HYGIENE_DENYLIST` | `scripts/hygiene-denylist.sha256` | `scripts/hygiene-check.js` | **Dev-tool-only**, not read by any plugin hook — points the hygiene scan's hashed private-vocabulary rule at an alternate denylist file. |
 
-## How an orchestrator uses this
+- **`postReportCommand`** (off by default) — this plugin has no opinion on
+  what, if anything, should happen after a report is delivered; configure a
+  shell command once (env var above, or `{ "postReportCommand": "..." }` in
+  `<data dir>/config.json`) and it runs detached, fire-and-forget, at most
+  once per agent transcript, with `SUBAGENT_REPORT_GUARD_AGENT_TRANSCRIPT_PATH`
+  / `SUBAGENT_REPORT_GUARD_AGENT_ID` added to its environment. With nothing
+  configured, this is a complete no-op.
+- **`dropboxRoot`** (default: unset — the lane drop-box lives inside this
+  plugin's own data dir) — point the lane drop-box's `teams/<session_id>/`
+  directory at a directory of your own choosing instead (env var above, or
+  `{ "dropboxRoot": "~/some/path" }` in `<data dir>/config.json`; `~` is
+  expanded). Use this only if you have your own tooling that already reads
+  a shared `.../teams/<session>/dropbox/` layout (e.g. co-located with
+  Claude Code's own per-session team-mailbox directory,
+  `~/.claude/teams/<session_id>/inboxes/`) and want this plugin to write
+  into the same place. **Caveat:** once set, everything the lane drop-box
+  writes lands OUTSIDE this plugin's data dir — those files are then yours
+  to manage and clean up; the one-directory uninstall below no longer
+  covers them.
 
-1. **At dispatch time**, scaffold the lane — either `require('./lib/lane-dropbox.js').scaffold({...})`
-   from Node, or the CLI (`node lib/lane-dropbox.js scaffold --session <id> --lane-id <id> --provider claude ...`)
-   for a third-party CLI lane. This writes the first record and establishes
-   the lane's file.
-2. **While it runs**, do nothing for a Claude lane — the two hooks write
-   checkpoints and heartbeats on their own, with zero orchestrator
-   involvement. A third-party CLI lane has no hooks available to it at
-   all, so there is nothing to do here either way.
-3. **When the lane terminates**, for a third-party CLI lane call
-   `captureReport({ sessionId, laneId, terminalReason, runId })` (or its
-   CLI form) yourself, once, on every termination path — normal exit,
-   timeout, spawn error. This is the only leg of the mechanism that isn't
-   automatic, because nothing in this repo observes a third-party
-   process's exit for you.
-4. **When a lane goes idle, stalls, or you just want to check in**, read
-   `~/.claude/teams/<session_id>/dropbox/<lane_id>.jsonl` directly. The
-   last `checkpoint` record's `report_text` is that lane's last known
-   report, verbatim, independent of whether `SendMessage` ever actually
-   delivered it; failing that, the last `report-capture` record's
-   `report_text` is a best-effort recovery of a third-party lane's last
-   output. The last `heartbeat_at` across any record type tells you how
-   recently the lane did *anything*, even if it never got as far as a
-   checkpoint.
-5. **Before re-dispatching under a reused `lane_id`** (a retry), call
-   `countReportCaptures({ sessionId, laneId })` first and keep the result
-   as your `after:<N>` baseline — then poll for the count growing past
-   `N`, not bare presence, so a prior run's own leftover record can't be
-   mistaken for the new run having finished.
+## Where state lives
 
-This is deliberately a plain JSONL file, not a database or a queue — `tail`,
-`jq`, or a one-line `readLaneRecords()` call are all you need to consume it.
+Everything this plugin writes lives under exactly one directory, resolved
+by `lib/paths.js`:
 
-## Verification
+1. `SUBAGENT_REPORT_GUARD_DATA_DIR`, if set (test override), else
+2. `CLAUDE_PLUGIN_DATA`, if the harness sets it for plugin hooks (recent
+   Claude Code builds do; **not independently confirmed as set on every
+   installed version** — this plugin works correctly either way), else
+3. `~/.claude/subagent-report-guard/`.
 
-This mechanism was checked against real multi-lane Claude Code sessions
-before release, not just unit tests against synthetic fixtures — that live
-testing caught a real attribution bug in the heartbeat hook's identity
-resolution (a fast-moving `PostToolUse` firing could get misattributed to a
-lane that had already stopped several seconds earlier); the bug, the fix,
-and the reasoning behind it are documented directly in
-`hooks/lane-dropbox-heartbeat.js`'s own header comment — not smoothed over.
-This repo was also independently reviewed by the `codex` CLI (a different
-model provider than the one that authored it) for publish-safety before
-being pushed public — see `git log` for that review's imprint on this
-history. The exported tree carries 100 tests (`node --test test/*.test.js`),
-covering both hooks and the underlying module: schema/return contracts,
-offset dedupe, lock contention, fail-open paths, the live-evidence-derived
-heartbeat attribution rule, `report-capture`'s run-identity dedupe (a
-content/byte-size dedupe was tried and rejected — see
-`test/lane-report-capture.test.js` for the repro it failed on), and a
-portability grep against hardcoded paths.
+Documented children of that one directory: `report-gate-state/`,
+`post-report-command/`, `pointers/<sessionId>/<agentId>.json`,
+`teams/<session_id>/dropbox/` + `teams/<session_id>/.state/` (the lane
+drop-box — see the `dropboxRoot` option above for redirecting this
+specific subtree elsewhere), and `logs/report-gate-invocations.log` (+ its
+`.1` rotation).
+
+With **default configuration and zero setup**, this is exhaustive: nothing
+this plugin ever writes lands anywhere else.
+
+## Uninstall
+
+```
+/plugin uninstall subagent-report-guard@claude-subagent-report-guard
+```
+
+(or just disable the plugin) — every hook is wired only through
+`hooks/hooks.json`, so uninstalling/disabling stops all of them
+immediately; nothing else on your system references this plugin. Optionally
+follow with `/plugin marketplace remove claude-subagent-report-guard` to
+also drop this repo's own marketplace registration.
+
+To also remove every byte of state this plugin ever wrote (default
+configuration — see the `dropboxRoot` caveat above if you configured it):
+
+```sh
+rm -rf ~/.claude/subagent-report-guard
+```
+
+That one directory is the whole of it — `test/uninstall.test.js` proves
+this is exhaustive: it runs every hook against a scratch `HOME` with
+nothing pre-existing, and asserts nothing is ever written outside
+`<HOME>/.claude/subagent-report-guard/`. A separate test in that same file
+proves the opposite, opt-in case: an explicitly configured `dropboxRoot`
+is honored and writes land there instead, outside the data dir — the
+escape hatch above, exercised so it's provably not accidental.
+
+## Tests
+
+```sh
+node --test test/*.test.js
+```
+
+A full test suite covers: the report gate's identity
+resolution (all four steps + the ambiguity/embed-trust rules),
+block-once/allow-plain behavior, the spawn-ledger discrimination
+(explicit-false/absent/true) and the peer-ack-loop-safe stale-report check;
+the lane drop-box's checkpoint/heartbeat hooks (offset dedupe, lock
+contention, fail-open paths, the heartbeat attribution rule, the
+terminal-record discrimination fields, and `isSafePathSegment`
+path-traversal rejection); the orphaned-pointer mechanism (written for
+every subagent, never surfaced when delivered — including the
+background-Agent-spawn launch-ack and enqueue-only cases that would
+otherwise be misattributed — surfaced once per hook type on both the
+same-session and prior-session paths, capped at 5 + "+N more", fast no-op
+when empty); the `dropboxRoot` self-containment default and its opt-in
+override; log rotation and its one-shot legacy migration script; the
+post-report command hook (off by default, fires at most once); the
+data-dir resolver; a self-install/uninstall round-trip against this repo's
+own `.claude-plugin/marketplace.json` via the `claude` CLI (skipped, not
+failed, when that CLI's non-interactive plugin support is unavailable);
+and the hygiene-check script's own self-test. A `.githooks/pre-commit` hook
+(enable with `git config core.hooksPath .githooks`) and
+`.github/workflows/ci.yml` both run the full suite plus the hygiene scan.
+
+The orphaned-pointer delivery-evidence shapes are modeled on sanitized
+excerpts of real local transcripts (see
+`test/fixtures/orphan-pointers/README.md`), matching the actual marker
+shapes Claude Code writes rather than shapes assumed from documentation
+alone.
 
 ## Known limitations
 
-- Identity resolution's recency-based fallback (used only when no
-  direct-sibling meta.json match and no explicit identity field is
-  available) is a heuristic, not a certainty — see
-  `lib/report-gate-identity.js`'s header for the three-step resolution order
-  and its accepted residual.
-- Neither mitigation here fixes the underlying platform behavior — they are
-  user-side workarounds, not upstream fixes.
-- `captureReport()`'s guarantee is only as good as the `--output-log` your
-  own orchestrator passes to `scaffold()`: this repo does not spawn your
-  third-party lane's process for you, so it cannot itself guarantee that
-  log is durably written before the child exits. A `scaffold` call whose
-  log path is never actually populated degrades to the stated
-  `unavailable_reason: 'unreadable-output-log'`/`'no-output-log'` rather
-  than crashing or fabricating content — but making the log real (e.g.
-  teeing the child's stdout to that path yourself, before or as you spawn
-  it) is on you.
-- `legacy-gate/` has its own known limitations — see its own README.
+- Identity resolution's recency-based fallback (reached only when no exact
+  step matches) is a heuristic, not a certainty — see `lib/report-gate.js`'s
+  header for the full four-step order and its accepted residual.
+- The orphaned-pointer mechanism's delivery check is real-evidence-based but
+  necessarily incomplete: a harness change to any of the recognized marker
+  shapes could make a genuinely-delivered report look undelivered (it would
+  then be surfaced once, redundantly — harmless, just noisy) or, in
+  principle, the reverse (silently over-claiming delivery) if a future
+  shape happens to collide with one of these patterns by coincidence; no
+  such collision has been observed.
+- Neither the report gate nor the lane drop-box fixes the underlying
+  platform behavior — they are user-side mitigations, not upstream fixes.
+- `CLAUDE_PLUGIN_DATA` support is unconfirmed on every Claude Code version;
+  the `~/.claude/subagent-report-guard/` fallback is exercised by every
+  test in this repo, so this plugin works correctly whether or not the
+  harness sets it.
 
 ## Contributing
 
 Found a different failure mode, a cleaner identity-resolution heuristic, or
 a case where a fail-open path didn't actually fail open? Issues and PRs are
-welcome — this is a small, self-contained kit and fixes from other setups
-are genuinely useful.
+welcome.
 
 ## License
 
