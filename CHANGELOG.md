@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.2
 
 - Fixed a false-positive orphan surfacing race in `UserPromptSubmit`:
   delivering a background-agent task-notification (or a team-mailbox
