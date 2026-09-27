@@ -91,12 +91,27 @@ function withDataDir(fn) {
   }
 }
 
-function runHook(payload, { dataDir } = {}) {
+function runHook(payload, { dataDir, logPath } = {}) {
+  const env = { ...process.env, SUBAGENT_REPORT_GUARD_DATA_DIR: dataDir || mkDataDir() };
+  if (logPath) env.SUBAGENT_REPORT_GUARD_LOG_PATH = logPath;
   return execFileSync(process.execPath, [HOOK], {
     input: payload === null ? '' : JSON.stringify(payload),
     encoding: 'utf8',
-    env: { ...process.env, SUBAGENT_REPORT_GUARD_DATA_DIR: dataDir || mkDataDir() },
+    env,
   });
+}
+
+// Reads every JSONL line from an invocation log file, parsed. Returns []
+// for a log that was never written (no invocation reached logInvocation, or
+// the dir doesn't exist yet) rather than throwing.
+function readLogLines(logPath) {
+  let raw;
+  try {
+    raw = fs.readFileSync(logPath, 'utf8');
+  } catch {
+    return [];
+  }
+  return raw.split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
 }
 
 // ── unit: resolveTeammateContext ────────────────────────────────────────────
@@ -528,6 +543,105 @@ test('stale-followup block is bounded: a NEW later follow-up blocks exactly once
   } finally {
     delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
   }
+});
+
+// ── invocation-log observability ────────────────────────────────────────────
+
+test('log: no-payload (empty stdin) — reason "no-payload", trace fields present, no content leaked', () => {
+  const logPath = path.join(mkDataDir(), 'invocations.log');
+  runHook(null, { logPath });
+  const lines = readLogLines(logPath);
+  assert.equal(lines.length, 1);
+  const line = lines[0];
+  assert.equal(line.outcome, 'not-team-mailbox-or-unresolvable');
+  assert.equal(line.reason, 'no-payload');
+  assert.equal(line.hook_event_name, null);
+  assert.equal(line.session_id, null);
+  assert.equal(line.agent_id, null);
+  assert.equal(line.agent_type, null);
+  assert.deepEqual(line.payload_keys, []);
+  assert.equal(line.has_agent_transcript_path, false);
+  assert.equal('resolutionMethod' in line, false, 'an unresolved firing never claims a resolutionMethod');
+});
+
+test('log: not-team-mailbox (payload parses, evaluate() returns null) — reason "not-team-mailbox", trace reflects the real payload', () => {
+  const { subagentsDir } = mkSessionFixture();
+  const { transcriptPath } = writeTeammate(subagentsDir, {
+    name: 'plain-logged', hash: 'a2a2a2a2', lines: [assistantText('plain subagent output')],
+    meta: { agentType: 'general-purpose', spawnDepth: 1 },
+  });
+  const logPath = path.join(mkDataDir(), 'invocations.log');
+  runHook({
+    hook_event_name: 'SubagentStop',
+    session_id: 'session-plain',
+    agent_id: 'a2a2a2a2plain',
+    agent_type: 'general-purpose',
+    transcript_path: transcriptPath,
+  }, { logPath });
+  const [line] = readLogLines(logPath);
+  assert.equal(line.outcome, 'not-team-mailbox-or-unresolvable');
+  assert.equal(line.reason, 'not-team-mailbox');
+  assert.equal(line.hook_event_name, 'SubagentStop');
+  assert.equal(line.session_id, 'session-plain');
+  assert.equal(line.agent_id, 'a2a2a2a2plain');
+  assert.equal(line.agent_type, 'general-purpose');
+  assert.deepEqual(line.payload_keys, ['agent_id', 'agent_type', 'hook_event_name', 'session_id', 'transcript_path']);
+  assert.equal(line.has_agent_transcript_path, false);
+});
+
+test('log: block outcome carries resolutionMethod and the full trace, never the embedded report text', () => {
+  const { subagentsDir } = mkSessionFixture();
+  const { transcriptPath } = writeTeammate(subagentsDir, {
+    name: 'logged-block', hash: 'd5d5d5d5', lines: [assistantText('this exact report text must never appear in the log')],
+  });
+  const logPath = path.join(mkDataDir(), 'invocations.log');
+  const out = runHook({
+    hook_event_name: 'SubagentStop',
+    session_id: 'session-block',
+    agent_transcript_path: transcriptPath,
+    transcript_path: transcriptPath,
+  }, { logPath });
+  assert.match(JSON.parse(out).reason, /this exact report text must never appear in the log/);
+
+  const [line] = readLogLines(logPath);
+  assert.equal(line.outcome, 'block');
+  assert.equal(line.resolutionMethod, 'agent-transcript-path');
+  assert.equal(line.hook_event_name, 'SubagentStop');
+  assert.equal(line.session_id, 'session-block');
+  assert.equal(line.has_agent_transcript_path, true);
+  const rawLine = fs.readFileSync(logPath, 'utf8');
+  assert.doesNotMatch(rawLine, /this exact report text must never appear in the log/);
+});
+
+test('log: allow outcome (plain, non-team-mailbox subagent already covered above) and delivered outcome both carry resolutionMethod', () => {
+  const { subagentsDir } = mkSessionFixture();
+  const { transcriptPath } = writeTeammate(subagentsDir, {
+    name: 'logged-delivered', hash: 'e6e6e6e6',
+    lines: [{ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'go' }] } }, sendMessageCall()],
+  });
+  const logPath = path.join(mkDataDir(), 'invocations.log');
+  runHook({ transcript_path: transcriptPath }, { logPath });
+  const [line] = readLogLines(logPath);
+  assert.equal(line.outcome, 'delivered');
+  assert.equal(line.resolutionMethod, 'direct-sibling');
+});
+
+test('log: every line carries payload_keys as a sorted array of key names only, never values', () => {
+  const { subagentsDir } = mkSessionFixture();
+  const { transcriptPath } = writeTeammate(subagentsDir, {
+    name: 'keys-lane', hash: 'f7f7f7f7', lines: [assistantText('key-shape report body')],
+  });
+  const logPath = path.join(mkDataDir(), 'invocations.log');
+  runHook({
+    session_id: 'super-secret-session-id-should-not-appear-as-a-value',
+    transcript_path: transcriptPath,
+  }, { logPath });
+  const [line] = readLogLines(logPath);
+  assert.deepEqual(line.payload_keys, ['session_id', 'transcript_path']);
+  // The session id VALUE is expected under `session_id` (a scalar trace
+  // field, not message content) — but must never appear duplicated inside
+  // `payload_keys`, which is names only.
+  assert.equal(line.payload_keys.includes('super-secret-session-id-should-not-appear-as-a-value'), false);
 });
 
 // ── source guards ────────────────────────────────────────────────────────

@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+- Report gate invocation log (`<data dir>/logs/report-gate-invocations.log`)
+  is now privacy-minimal but far more diagnosable: every line carries
+  `hook_event_name`, `session_id`, `agent_id`, `agent_type`, `payload_keys`
+  (key names only, never values), and `has_agent_transcript_path`; every
+  RESOLVED outcome (`block`/`allow`/`delivered`) also carries
+  `resolutionMethod`. The previously single `not-team-mailbox-or-unresolvable`
+  outcome now also carries `reason`, distinguishing `no-payload` (stdin
+  empty/unparseable) from `not-team-mailbox` (a payload parsed but
+  `evaluate()` returned null). `lib/report-gate.js`'s `evaluate()` now
+  threads `resolutionMethod` through every one of its return objects
+  (decision logic unchanged). Never logs message content or a full
+  filesystem path. Existing `outcome` values are unchanged for back-compat.
+- Added `test/report-gate-real-shape.test.js` plus sanitized fixtures
+  (`test/fixtures/real-shape-2026-09-27/`) reproducing the real live
+  meta.json + transcript.jsonl shapes from the 2026-09-27
+  `gate-live-test` incident, covering: first-stop block with the verbatim
+  embed, one-shot allow on replay, delivered after an appended SendMessage,
+  a plain (non-team-mailbox) subagent never gating, resolution via
+  `payload-identity-field` when `agent_transcript_path` is absent, and an
+  end-to-end child-process run asserting both the stdout decision and the
+  new log line's shape.
+- README: documented that plugin hooks load only at session START (a
+  session already running when this plugin is installed/updated will not
+  run the gate — this is the confirmed root cause of the 2026-09-27
+  incident above) and that Claude Code's plugin CLI (`claude plugin
+  install`/`uninstall`/`marketplace add`) has been observed to silently
+  drop `name` keys from hook entries when it re-serializes
+  `~/.claude/settings.json` — back up and diff before running it. Also
+  documented the invocation log's full field set under a new "Report gate
+  — invocation log" section.
+
 ## 2.0.2
 
 - Fixed a false-positive orphan surfacing race in `UserPromptSubmit`:

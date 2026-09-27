@@ -78,6 +78,44 @@ work around.
   generic, off-by-default `postReportCommand` hook below, which has no
   opinion on what, if anything, should happen next.
 
+#### Report gate — invocation log
+
+Every firing of `hooks/report-gate.js` appends one JSON line to
+`<data dir>/logs/report-gate-invocations.log` (override via
+`SUBAGENT_REPORT_GUARD_LOG_PATH`), regardless of outcome — this is the
+first place to look if a gate you expected to fire didn't (see the
+"Plugin hooks load at session START" install note above). Every line
+carries:
+
+- `ts` — ISO timestamp of the log write.
+- `outcome` — one of `block` / `allow` / `delivered` /
+  `not-team-mailbox-or-unresolvable` (unchanged names, for back-compat with
+  any existing log-scraping).
+- `reason` — present only on `not-team-mailbox-or-unresolvable`:
+  `no-payload` (stdin was empty or unparseable — the hook never even had a
+  payload to evaluate) or `not-team-mailbox` (a payload DID parse, but
+  `evaluate()` returned null — not a team-mailbox participant, or genuinely
+  unresolvable). These were previously indistinguishable under one outcome
+  string, which is exactly what made a real "hooks never loaded" incident
+  (2026-09-27) look identical to ordinary non-team-mailbox traffic in the
+  log — a handful of manual empty-payload smoke-test lines and a genuine
+  resolution gap were both just `not-team-mailbox-or-unresolvable` with no
+  further detail.
+- `resolutionMethod` — present on every RESOLVED outcome (`block` / `allow`
+  / `delivered`): the same value `resolveTeammateContext` returned
+  (`agent-transcript-path` / `direct-sibling` / `payload-identity-field` /
+  `payload-identity-path` / `recency-heuristic`). Absent on
+  `not-team-mailbox-or-unresolvable`, since nothing was resolved.
+- A privacy-minimal trace, on EVERY line regardless of outcome:
+  `hook_event_name`, `session_id`, `agent_id`, `agent_type`, `payload_keys`
+  (the incoming payload's own top-level key NAMES only, sorted — never its
+  values), and `has_agent_transcript_path` (boolean).
+
+**Never logged, on any line, under any outcome:** message content
+(`last_assistant_message`, or any transcript text embedded in a block
+reason), or any full filesystem path beyond a basename. This log is safe to
+read, grep, or attach to a bug report without redaction.
+
 ### Lane drop-box — the details
 
 Two hooks write append-only JSONL records to
@@ -190,6 +228,30 @@ That's it — every hook is wired via `hooks/hooks.json` (using
 `${CLAUDE_PLUGIN_ROOT}`, never a hand-edited absolute path), and every
 directory this plugin ever writes to is created lazily on first use. No
 `settings.json` edit, no symlink, no copy step, anywhere.
+
+**Plugin hooks load at session START.** Claude Code reads a plugin's
+`hooks/hooks.json` when a session starts — installing, enabling, or
+updating this plugin mid-session does not retroactively wire its hooks into
+that already-running session. **Start a new session after
+install/enable/update** or none of this plugin's hooks will fire for the
+rest of the old one. This is not theoretical: it is the confirmed root
+cause of a real "the report gate didn't fire" incident (2026-09-27) — a
+session that started before install ran for hours afterward with none of
+this plugin's hooks loaded, and the only local evidence was silence (no
+invocation log entries at all for that session), not an error. If a gate
+you expected to fire didn't, first check whether `hooks/report-gate.js` ran
+for that session at all: grep `<data dir>/logs/report-gate-invocations.log`
+for the session's `session_id` (every line carries one, even the
+unresolved outcome — see "Report gate — invocation log" below) — no
+matching lines means the hooks never loaded, not that resolution failed.
+
+**Warning — the plugin CLI can silently corrupt hook wiring in
+`settings.json`.** Claude Code's plugin CLI (`claude plugin install` /
+`uninstall` / `marketplace add`, observed on 2.1.283) re-serializes the
+entire `~/.claude/settings.json` file and has been observed to silently
+drop `name` keys from existing hook entries in the process — with no
+warning, on an unrelated plugin operation. Back up `~/.claude/settings.json`
+before running any `claude plugin ...` command and diff it afterward.
 
 ## Configuration
 
