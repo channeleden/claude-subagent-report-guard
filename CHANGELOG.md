@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Fixed a false-positive orphan surfacing race in `UserPromptSubmit`:
+  delivering a background-agent task-notification (or a team-mailbox
+  agent/teammate message) to the parent is itself the prompt that fires this
+  hook, arriving before the harness appends the delivery entry to the
+  transcript — the hook now checks its own raw `prompt` payload text for
+  that delivery first (`claimPointersDeliveredByPrompt`) and claims the
+  pointer immediately, independent of the transcript scan.
+- `UserPromptSubmit` no longer surfaces an undelivered pointer on the very
+  next prompt. A same-session top-level pointer now surfaces only once
+  undelivered for longer than `SUBAGENT_REPORT_GUARD_PARENT_GONE_GRACE_MS`
+  (default 10 min); a nested pointer whose parent agent has already
+  finished now waits out a minimum settle time,
+  `SUBAGENT_REPORT_GUARD_NESTED_SETTLE_MS` (default 30 s), before
+  surfacing. `SessionStart` is unaffected.
+
 ## 2.0.1
 
 - Fixed a Linux stdin `EAGAIN` bug that made hooks silently no-op on Linux.

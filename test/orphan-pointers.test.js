@@ -677,9 +677,11 @@ test('UserPromptSubmit hook: a delivered pointer is marked claimed and never sur
   }
 });
 
-// ── integration: UserPromptSubmit surfaces an undelivered pointer once ──
+// ── integration: UserPromptSubmit surfaces an undelivered pointer once,
+// only once it is well past the grace period (see the race-fix tests below
+// for the sub-grace-period and delivery-race behavior this supersedes) ──
 
-test('UserPromptSubmit hook: surfaces an undelivered pointer, then never again (at-most-once)', () => {
+test('UserPromptSubmit hook: surfaces an undelivered pointer once past the grace period, then never again (at-most-once)', () => {
   const { subagentsDir } = mkSessionFixture();
   const { transcriptPath } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_UNDELIV1' });
   const sessionDir = path.dirname(subagentsDir);
@@ -691,7 +693,9 @@ test('UserPromptSubmit hook: surfaces an undelivered pointer, then never again (
   try {
     writePointer({
       sessionId, agentId: 'agent-aundeliv1', transcriptPath, agentName: null,
-      parentSessionId: sessionId, finishedAt: new Date().toISOString(), summary: 'undelivered work',
+      // Well past the default 10-minute grace period — the top-level
+      // surfacing gate must not hold this back any longer.
+      parentSessionId: sessionId, finishedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(), summary: 'undelivered work',
     });
   } finally {
     delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
@@ -705,6 +709,155 @@ test('UserPromptSubmit hook: surfaces an undelivered pointer, then never again (
 
   const second = runHook(USER_PROMPT_HOOK, payload, { dataDir });
   assert.equal(second.trim(), '', 'must not surface the same pointer twice via the same hook');
+});
+
+// ── race-fix regression coverage: the exact false-positive this session
+// closed — a task-notification's own prompt delivering a pointer's result
+// must claim it immediately, and an undelivered TOP-LEVEL/NESTED pointer
+// must never surface before its respective grace/settle window elapses ──
+
+test('UserPromptSubmit hook: the task-notification prompt itself delivers the pointer — claimed, never surfaced, even though the transcript has no delivery entry yet', () => {
+  const { subagentsDir } = mkSessionFixture();
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { name: 'racefix', hash: 'race0001', toolUseId: 'toolu_RACEFIX1' });
+  const sessionDir = path.dirname(subagentsDir);
+  const sessionId = path.basename(sessionDir);
+  const parentPath = `${sessionDir}.jsonl`;
+  // The parent transcript has ONLY the enqueue bookkeeping line — exactly
+  // the real observed sequence: the delivery entry (`type: "user"` carrying
+  // the task-notification) has not been appended yet at the moment this
+  // hook process reads the transcript, because delivering it IS what fires
+  // this very hook invocation.
+  fs.writeFileSync(parentPath, `${JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: `<task-notification>\n<task-id>${agentId}</task-id>\n</task-notification>` })}\n`, 'utf8');
+
+  const dataDir = mkDataDir();
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    writePointer({
+      sessionId, agentId, transcriptPath, agentName: null,
+      parentSessionId: sessionId, finishedAt: new Date().toISOString(), summary: 'racefix result',
+    });
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  const taskNotificationPrompt = `<task-notification>\n<task-id>${agentId}</task-id>\n<status>completed</status>\n<result>racefix result</result>\n</task-notification>`;
+  const out = runHook(USER_PROMPT_HOOK, { session_id: sessionId, transcript_path: parentPath, prompt: taskNotificationPrompt }, { dataDir });
+  assert.equal(out.trim(), '', 'must not surface a pointer whose delivery IS this very prompt');
+
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    const [entry] = listPointersForSession(sessionId);
+    assert.equal(entry.record.claimed, true, 'must be claimed straight from the prompt text, independent of the transcript scan');
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+});
+
+test('UserPromptSubmit hook: a top-level pointer finished 5s ago with no delivery is NOT surfaced yet', () => {
+  const { subagentsDir } = mkSessionFixture();
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { name: 'fresh', hash: 'fresh001', toolUseId: 'toolu_FRESH1' });
+  const sessionDir = path.dirname(subagentsDir);
+  const sessionId = path.basename(sessionDir);
+  const parentPath = `${sessionDir}.jsonl`;
+  fs.writeFileSync(parentPath, '', 'utf8');
+
+  const dataDir = mkDataDir();
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    writePointer({
+      sessionId, agentId, transcriptPath, agentName: null,
+      parentSessionId: sessionId, finishedAt: new Date(Date.now() - 5000).toISOString(), summary: 'too fresh to surface',
+    });
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  const out = runHook(USER_PROMPT_HOOK, { session_id: sessionId, transcript_path: parentPath }, { dataDir });
+  assert.equal(out.trim(), '', 'a top-level pointer within the grace period must not surface yet');
+
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    const [entry] = listPointersForSession(sessionId);
+    assert.equal(entry.record.claimed, false, 'must remain unclaimed — held back by the grace period, not falsely marked delivered');
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+});
+
+test('UserPromptSubmit hook: the SAME pointer at finishedAt+11min with no delivery IS surfaced once', () => {
+  const { subagentsDir } = mkSessionFixture();
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { name: 'stale', hash: 'stale001', toolUseId: 'toolu_STALE1' });
+  const sessionDir = path.dirname(subagentsDir);
+  const sessionId = path.basename(sessionDir);
+  const parentPath = `${sessionDir}.jsonl`;
+  fs.writeFileSync(parentPath, '', 'utf8');
+
+  const dataDir = mkDataDir();
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    writePointer({
+      sessionId, agentId, transcriptPath, agentName: null,
+      parentSessionId: sessionId, finishedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(), summary: 'now stale enough',
+    });
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  const payload = { session_id: sessionId, transcript_path: parentPath };
+  const first = runHook(USER_PROMPT_HOOK, payload, { dataDir });
+  const parsed = JSON.parse(first);
+  assert.match(parsed.hookSpecificOutput.additionalContext, /now stale enough/);
+
+  const second = runHook(USER_PROMPT_HOOK, payload, { dataDir });
+  assert.equal(second.trim(), '', 'must not surface the same pointer twice');
+});
+
+test('UserPromptSubmit hook: a nested pointer with a dead parent agent is surfaced once, only after the settle time', () => {
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+  const parent = writePlainSubagent(subagentsDir, { name: 'deadparent2', hash: 'dp2a0001', toolUseId: 'toolu_DEADPARENT2' });
+  const child = writePlainSubagent(subagentsDir, {
+    name: 'orphanchild2', hash: 'oc2b0002', toolUseId: 'toolu_ORPHANCHILD2', parentAgentId: parent.agentId,
+  });
+  fs.writeFileSync(leadTranscriptPath, '', 'utf8');
+
+  const dataDir = mkDataDir();
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    // The parent AGENT already finished — its own pointer exists.
+    writePointer({
+      sessionId, agentId: parent.agentId, transcriptPath: parent.transcriptPath, agentName: null,
+      toolUseId: 'toolu_DEADPARENT2', parentSessionId: sessionId, finishedAt: new Date().toISOString(), summary: 'parent finished',
+    });
+    // The nested child finished only 5s ago — well within the settle window.
+    writePointer({
+      sessionId, agentId: child.agentId, transcriptPath: child.transcriptPath, agentName: null,
+      toolUseId: 'toolu_ORPHANCHILD2', parentSessionId: sessionId, parentAgentId: parent.agentId,
+      finishedAt: new Date(Date.now() - 5000).toISOString(), summary: 'nested, too fresh to surface yet',
+    });
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  const payload = { session_id: sessionId, transcript_path: leadTranscriptPath };
+  const withinSettle = runHook(USER_PROMPT_HOOK, payload, { dataDir });
+  assert.equal(withinSettle.trim(), '', 'a dead-parent nested pointer within the settle window must not surface yet');
+
+  // Now the child is past the settle window (30s default) — surfaced once.
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    const [childEntry] = listPointersForSession(sessionId).filter((e) => e.agentId === child.agentId);
+    childEntry.record.finishedAt = new Date(Date.now() - 31 * 1000).toISOString();
+    fs.writeFileSync(childEntry.path, JSON.stringify(childEntry.record), 'utf8');
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  const pastSettle = runHook(USER_PROMPT_HOOK, payload, { dataDir });
+  const parsed = JSON.parse(pastSettle);
+  assert.match(parsed.hookSpecificOutput.additionalContext, /nested, too fresh to surface yet/);
+
+  const second = runHook(USER_PROMPT_HOOK, payload, { dataDir });
+  assert.equal(second.trim(), '', 'must not surface the same nested pointer twice');
 });
 
 // ── integration: empty pointers dir is a fast no-op (no transcript reads) ─

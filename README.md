@@ -148,12 +148,27 @@ header (a `tool_use_id` match for a foreground dispatch's sidecar-recorded
 teammate_id="...">` / `task-notification` marker for a team-mailbox one).
 If found, the pointer is marked `claimed` and never surfaced.
 
-- **`UserPromptSubmit`** — surfaces any of THIS session's unclaimed,
-  undelivered pointers as `additionalContext`, once per pointer.
+- **`UserPromptSubmit`** — the parent session is alive by definition while
+  this hook runs (it is that session's own next prompt), so a
+  queued-but-not-yet-delivered notification is normal, not an orphan.
+  Delivering a task-notification or team-mailbox agent/teammate message to
+  the parent can *be* the very prompt that fires this hook, before the
+  harness has appended that delivery entry to the transcript — this hook
+  checks its own raw prompt text for that delivery first and claims the
+  pointer immediately when found, independent of the transcript scan. Once
+  that's ruled out, a **top-level** pointer (dispatched directly by this
+  session) surfaces only once undelivered for longer than the grace period
+  (`SUBAGENT_REPORT_GUARD_PARENT_GONE_GRACE_MS`, default 10 min); a
+  **nested** pointer (spawned by another subagent, whose parent agent has
+  itself already finished) surfaces once its own settle time has elapsed
+  (`SUBAGENT_REPORT_GUARD_NESTED_SETTLE_MS`, default 30 s) — never on the
+  very next prompt, and never twice for the same pointer.
 - **`SessionStart`** — surfaces unclaimed, undelivered pointers left behind
   by a prior/dead session (the parent's own transcript has gone quiet past
   a grace period, or the current session id differs from the pointer's
-  recorded parent), once per pointer.
+  recorded parent), once per pointer. Unaffected by the `UserPromptSubmit`
+  gating above — a dead session can never receive an in-flight delivery, so
+  there is nothing to race.
 
 Both surfacing hooks cap the list at 5 items (`+N more at <pointers dir>`)
 and are a fast, transcript-read-free no-op whenever no pointer has ever
@@ -192,7 +207,8 @@ Everything is optional; every default is sensible with zero configuration.
 | `SUBAGENT_REPORT_GUARD_LOG_MAX_BYTES` | `2097152` (2 MB) | `lib/log-rotation.js` | Size-capped rotation threshold for this plugin's append-only logs. |
 | `SUBAGENT_REPORT_GUARD_LOG_PATH` | `<data dir>/logs/report-gate-invocations.log` | `hooks/report-gate.js` | Override the report gate's invocation log path. |
 | `SUBAGENT_REPORT_GUARD_TAIL_SCAN_BYTES` | `2097152` (2 MB) | `lib/orphan-pointers.js` | Cap on the bounded tail-read of the parent transcript used to check for delivery evidence. |
-| `SUBAGENT_REPORT_GUARD_PARENT_GONE_GRACE_MS` | `600000` (10 min) | `lib/orphan-pointers.js` | Grace period before a quiet parent transcript is treated as a dead/prior session for cross-session pointer surfacing. |
+| `SUBAGENT_REPORT_GUARD_PARENT_GONE_GRACE_MS` | `600000` (10 min) | `lib/orphan-pointers.js` | Grace period before a quiet parent transcript is treated as a dead/prior session for cross-session pointer surfacing; also the minimum time a same-session TOP-LEVEL pointer must stay undelivered before `UserPromptSubmit` will ever surface it. |
+| `SUBAGENT_REPORT_GUARD_NESTED_SETTLE_MS` | `30000` (30 s) | `lib/orphan-pointers.js` | Minimum time a NESTED pointer (spawned by another subagent) must stay finished before `UserPromptSubmit` will surface it, even once its parent agent is already gone — avoids racing an in-flight notification to a parent agent that just stopped. |
 | `SUBAGENT_REPORT_GUARD_DROPBOX_ROOT` | unset | `lib/paths.js` | Same effect as `{ "dropboxRoot": "~/some/path" }` in `<data dir>/config.json`; the env var wins if both are set. See the `dropboxRoot` details below. |
 | `SUBAGENT_REPORT_GUARD_DATA_DIR` | unset | `lib/paths.js` | Override this plugin's data dir entirely. **Test-only** — used by this repo's own tests; a real install should not need it. |
 | `CLAUDE_PLUGIN_DATA` | unset | `lib/paths.js` | Set by the Claude Code harness itself (not this plugin) on builds that support it; used as the data dir when `SUBAGENT_REPORT_GUARD_DATA_DIR` is unset. |

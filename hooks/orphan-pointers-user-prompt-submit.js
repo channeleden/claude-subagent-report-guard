@@ -12,6 +12,18 @@
  *
  * Fast no-op path: when this plugin has never written a pointer, returns
  * immediately without touching any transcript.
+ *
+ * DELIVERY-RACE FIX: delivering a background-agent task-notification (or a
+ * team-mailbox agent/teammate message) to the parent IS ITSELF the prompt
+ * that fires this hook — the harness has not yet appended that delivery
+ * entry to the transcript by the time this process runs, so a
+ * transcript-only check would still see "no evidence" and wrongly report an
+ * undelivered result at the exact moment it is being delivered. This hook
+ * therefore checks its own raw `prompt` payload text for that delivery
+ * FIRST (`claimPointersDeliveredByPrompt`), then applies a grace period
+ * before ever surfacing what's left (`isEligibleForUserPromptSubmitSurfacing`)
+ * — see lib/orphan-pointers.js's "SURFACING POLICY" section for the full
+ * rationale.
  */
 
 const path = require('path');
@@ -21,6 +33,8 @@ const {
   markSurfaced,
   formatPointerList,
   pointersRootDir,
+  claimPointersDeliveredByPrompt,
+  isEligibleForUserPromptSubmitSurfacing,
 } = require('../lib/orphan-pointers.js');
 const { subagentSessionDir } = require('../lib/subagent-transcript.js');
 const { isSafePathSegment } = require('../lib/path-safety.js');
@@ -65,7 +79,16 @@ function main() {
     // (no-op), never throw or attempt the read.
     if (!sessionId || !isSafePathSegment(sessionId)) return process.exit(0);
 
-    const eligible = reconcileAndFilter(sessionId, 'userPromptSubmit');
+    const prompt = payload && typeof payload.prompt === 'string' ? payload.prompt : '';
+    // The task-notification / agent-message delivering a pointer's result
+    // can BE this very prompt (see the file header's "DELIVERY-RACE FIX") —
+    // claim straight from its raw text before any surfacing decision below,
+    // so it is never mistaken for undelivered.
+    claimPointersDeliveredByPrompt(sessionId, prompt);
+
+    const now = Date.now();
+    const reconciled = reconcileAndFilter(sessionId, 'userPromptSubmit', { now });
+    const eligible = reconciled.filter((entry) => isEligibleForUserPromptSubmitSurfacing(entry, { now }));
     if (!eligible.length) return process.exit(0);
 
     // `markSurfaced` returns true only for the entries THIS process actually
