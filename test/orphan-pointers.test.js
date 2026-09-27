@@ -30,6 +30,8 @@ const {
   isSurfaceMarked,
   pointerPath,
   pointersDirFor,
+  isParentGone,
+  isParentAgentFinished,
 } = require('../lib/orphan-pointers.js');
 const { harnessAgentId } = require('../hooks/orphan-pointers-subagent-stop.js');
 
@@ -49,20 +51,45 @@ function mkSessionFixture() {
   return { root, sessionId, leadTranscriptPath, subagentsDir };
 }
 
-function writePlainSubagent(subagentsDir, { name = 'plain', hash = 'a1a1a1a1', toolUseId, text = 'plain output' } = {}) {
-  const transcriptPath = path.join(subagentsDir, `agent-a${name}-${hash}.jsonl`);
-  const metaPath = path.join(subagentsDir, `agent-a${name}-${hash}.meta.json`);
+function writePlainSubagent(subagentsDir, { name = 'plain', hash = 'a1a1a1a1', toolUseId, text = 'plain output', parentAgentId } = {}) {
+  const agentId = `a${name}-${hash}`;
+  const transcriptPath = path.join(subagentsDir, `agent-${agentId}.jsonl`);
+  const metaPath = path.join(subagentsDir, `agent-${agentId}.meta.json`);
   fs.writeFileSync(transcriptPath, `${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] } })}\n`, 'utf8');
-  fs.writeFileSync(metaPath, JSON.stringify({ agentType: 'general-purpose', spawnDepth: 1, toolUseId }), 'utf8');
-  return { transcriptPath, metaPath };
+  fs.writeFileSync(metaPath, JSON.stringify({
+    agentType: 'general-purpose',
+    spawnDepth: parentAgentId ? 2 : 1,
+    toolUseId,
+    ...(parentAgentId ? { parentAgentId } : {}),
+  }), 'utf8');
+  return { transcriptPath, metaPath, agentId };
 }
 
 function writeTeamMailboxAgent(subagentsDir, { name = 'triage', hash = 'bbbb2222', text = 'teammate report' } = {}) {
-  const transcriptPath = path.join(subagentsDir, `agent-a${name}-${hash}.jsonl`);
-  const metaPath = path.join(subagentsDir, `agent-a${name}-${hash}.meta.json`);
+  const agentId = `a${name}-${hash}`;
+  const transcriptPath = path.join(subagentsDir, `agent-${agentId}.jsonl`);
+  const metaPath = path.join(subagentsDir, `agent-${agentId}.meta.json`);
   fs.writeFileSync(transcriptPath, `${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] } })}\n`, 'utf8');
   fs.writeFileSync(metaPath, JSON.stringify({ agentType: name, name, spawnDepth: 0, taskKind: 'in_process_teammate' }), 'utf8');
-  return { transcriptPath, metaPath };
+  return { transcriptPath, metaPath, agentId };
+}
+
+// Builds a REAL SubagentStop hook payload — see the comment atop
+// hooks/orphan-pointers-subagent-stop.js: `transcript_path` is ALWAYS the
+// top-level SESSION transcript, never the stopping agent's own file; the
+// agent's own transcript is named directly by `agent_transcript_path`.
+// Modeled verbatim on the live-observed payload keys: agent_id,
+// agent_transcript_path, session_id, last_assistant_message (plus fields
+// this mechanism does not use — transcript_path is the only other one these
+// tests need).
+function realSubagentStopPayload({ sessionId, leadTranscriptPath, agentTranscriptPath, agentId, lastAssistantMessage }) {
+  return {
+    session_id: sessionId,
+    transcript_path: leadTranscriptPath,
+    agent_transcript_path: agentTranscriptPath,
+    agent_id: agentId,
+    last_assistant_message: lastAssistantMessage,
+  };
 }
 
 // Appends one JSONL line per entry to a parent transcript file — the
@@ -449,10 +476,39 @@ test('formatPointerList: caps at 5 items and appends a "+N more" line', () => {
 });
 
 // ── integration: SubagentStop writer never blocks a plain subagent ─────
+//
+// Uses the REAL payload shape (see hooks/orphan-pointers-subagent-stop.js's
+// file header): `transcript_path` is the top-level SESSION transcript,
+// `agent_transcript_path` names the stopping agent's own file directly, and
+// `session_id` / `last_assistant_message` are supplied outright rather than
+// re-derived. This is the exact case Bug 1 closed: a naive direct-sibling
+// lookup against `transcript_path` alone would find nothing here at all.
 
-test('SubagentStop hook: writes a pointer for a plain Task-tool subagent and never blocks', () => {
+test('SubagentStop hook: real payload shape — writes a pointer for a plain background subagent and never blocks', () => {
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_PLAIN1', text: 'plain subagent final report' });
+  const dataDir = mkDataDir();
+  const payload = realSubagentStopPayload({
+    sessionId, leadTranscriptPath, agentTranscriptPath: transcriptPath, agentId, lastAssistantMessage: 'plain subagent final report',
+  });
+  const out = runHook(SUBAGENT_STOP_HOOK, payload, { dataDir });
+  assert.equal(out.trim(), ''); // never blocks / never emits a decision
+
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    const entries = listPointersForSession(sessionId);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].record.claimed, false);
+    assert.equal(entries[0].record.transcriptPath, transcriptPath, 'must resolve to the AGENT\'s own transcript, not the session file');
+    assert.equal(entries[0].record.summary, 'plain subagent final report', 'must use last_assistant_message directly, no transcript read needed');
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+});
+
+test('SubagentStop hook: legacy payload shape (transcript_path pointing straight at the agent file) still resolves — back-compat fallback', () => {
   const { subagentsDir } = mkSessionFixture();
-  const { transcriptPath } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_PLAIN1' });
+  const { transcriptPath } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_PLAINLEGACY' });
   const dataDir = mkDataDir();
   const out = runHook(SUBAGENT_STOP_HOOK, { transcript_path: transcriptPath }, { dataDir });
   assert.equal(out.trim(), ''); // never blocks / never emits a decision
@@ -478,19 +534,14 @@ test('SubagentStop hook: malformed/empty stdin never throws, never writes anythi
 // surfaced by EITHER hook once genuinely delivered ──────────────────────
 
 test('end to end: background Agent spawn delivered via task-notification is never surfaced by UserPromptSubmit or SessionStart', () => {
-  const { subagentsDir } = mkSessionFixture();
-  const { transcriptPath } = writePlainSubagent(subagentsDir, { name: 'bg', hash: 'fakee2e1', toolUseId: 'toolu_E2E1' });
-  const sessionDir = path.dirname(subagentsDir);
-  const sessionId = path.basename(sessionDir);
-  const parentPath = `${sessionDir}.jsonl`;
-  fs.writeFileSync(parentPath, '', 'utf8');
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { name: 'bg', hash: 'fakee2e1', toolUseId: 'toolu_E2E1' });
+  const parentPath = leadTranscriptPath;
   // The launch ack (never delivery) followed by the real queued->delivered
   // task-notification sequence — the exact real shape this fix closes.
   // writePlainSubagent(name: 'bg', hash: 'fakee2e1') names the transcript
-  // `agent-abg-fakee2e1.jsonl` — harnessAgentId() (as the real SubagentStop
-  // hook computes it) derives `abg-fakee2e1` from that, which is therefore
-  // the exact id the fixture's task-notification must carry.
-  const agentId = 'abg-fakee2e1';
+  // `agent-abg-fakee2e1.jsonl`, so `agentId` (returned above) is
+  // `abg-fakee2e1` — the exact id the fixture's task-notification must carry.
   appendParentEntries(parentPath, [
     {
       type: 'user',
@@ -499,7 +550,11 @@ test('end to end: background Agent spawn delivered via task-notification is neve
   ]);
 
   const dataDir = mkDataDir();
-  const out = runHook(SUBAGENT_STOP_HOOK, { transcript_path: transcriptPath }, { dataDir });
+  // Real SubagentStop payload shape — transcript_path is the SESSION file,
+  // agent_transcript_path names the stopping agent's own file directly.
+  const out = runHook(SUBAGENT_STOP_HOOK, realSubagentStopPayload({
+    sessionId, leadTranscriptPath, agentTranscriptPath: transcriptPath, agentId, lastAssistantMessage: 'plain output',
+  }), { dataDir });
   assert.equal(out.trim(), '');
 
   // Now the real completion lands.
@@ -599,10 +654,12 @@ test('SubagentStop hook: the writer path (a real, small transcript) stays well u
   // pointer for every finished subagent), but it must still stay cheap: the
   // scan is a small, bounded transcript read, never anything proportional to
   // the whole session.
-  const { subagentsDir } = mkSessionFixture();
-  const { transcriptPath } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_PERF1' });
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_PERF1' });
   const start = Date.now();
-  const out = runHook(SUBAGENT_STOP_HOOK, { transcript_path: transcriptPath }, { dataDir: mkDataDir() });
+  const out = runHook(SUBAGENT_STOP_HOOK, realSubagentStopPayload({
+    sessionId, leadTranscriptPath, agentTranscriptPath: transcriptPath, agentId, lastAssistantMessage: 'plain output',
+  }), { dataDir: mkDataDir() });
   const elapsed = Date.now() - start;
   assert.equal(out.trim(), '');
   assert.ok(elapsed < 2000, `SubagentStop hook process (incl. node startup) took ${elapsed}ms — investigate if this regresses`);
@@ -753,4 +810,159 @@ test('UserPromptSubmit hook: a path-traversal session_id in the payload is a sil
   const out = runHook(USER_PROMPT_HOOK, { session_id: '../../../../tmp/orphan-ptr-hook-escape', transcript_path: transcriptPath }, { dataDir });
   assert.equal(out.trim(), '', 'a traversal-shaped session_id must fail open silently, never surface or throw');
   assert.equal(fs.existsSync('/tmp/orphan-ptr-hook-escape'), false);
+});
+
+// ── nested agents (spawned by ANOTHER subagent, not the top-level session
+// directly) — the orphan case this pointer-plus-fix specifically covers: a
+// teammate spawns a plain lane, then the teammate itself dies before ever
+// consuming that lane's task-notification. See `parentTranscriptPathFor` /
+// `isParentAgentFinished` in lib/orphan-pointers.js for the mechanism.
+
+test('nested lane whose parent agent consumed the task-notification — delivered, never surfaced', () => {
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+
+  // The PARENT is itself a plain background lane, dispatched by the
+  // top-level session (spawnDepth 1, no parentAgentId of its own).
+  const parent = writePlainSubagent(subagentsDir, { name: 'parent', hash: 'ppppaaa1', toolUseId: 'toolu_PARENT1' });
+  // The CHILD is NESTED — spawned by the parent above, not by the top-level
+  // session (spawnDepth 2, meta carries parentAgentId).
+  const child = writePlainSubagent(subagentsDir, {
+    name: 'child', hash: 'ccccbbb1', toolUseId: 'toolu_CHILD1', parentAgentId: parent.agentId,
+  });
+
+  const dataDir = mkDataDir();
+  // The real SubagentStop hook run for the child: its own meta sidecar
+  // carries `parentAgentId`, which this hook must thread onto the pointer
+  // record without any extra payload field of its own.
+  const stopOut = runHook(SUBAGENT_STOP_HOOK, realSubagentStopPayload({
+    sessionId, leadTranscriptPath, agentTranscriptPath: child.transcriptPath, agentId: child.agentId, lastAssistantMessage: 'child report',
+  }), { dataDir });
+  assert.equal(stopOut.trim(), '');
+
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    const [entry] = listPointersForSession(sessionId);
+    assert.equal(entry.record.parentAgentId, parent.agentId, 'the pointer must record the PARENT AGENT, not the top-level session');
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  // The parent AGENT's own transcript — NOT the top-level session
+  // transcript — receives the child's delivered task-notification. If this
+  // fix only checked the top-level session transcript (the pre-fix
+  // behavior), this would never be found and the pointer would wrongly
+  // surface as an orphan.
+  appendParentEntries(parent.transcriptPath, [
+    { type: 'queue-operation', operation: 'enqueue', content: `<task-notification>\n<task-id>${child.agentId}</task-id>\n</task-notification>` },
+    { type: 'queue-operation', operation: 'dequeue' },
+    {
+      type: 'attachment',
+      attachment: { type: 'queued_command', prompt: `<task-notification>\n<task-id>${child.agentId}</task-id>\n<status>completed</status>\n</task-notification>`, commandMode: 'task-notification' },
+    },
+  ]);
+  // The top-level session transcript stays empty/irrelevant — delivery must
+  // be found on the PARENT AGENT's transcript, never the session's.
+  fs.writeFileSync(leadTranscriptPath, '', 'utf8');
+
+  const upOut = runHook(USER_PROMPT_HOOK, { session_id: sessionId, transcript_path: leadTranscriptPath }, { dataDir });
+  assert.equal(upOut.trim(), '', 'a nested pointer delivered via its PARENT AGENT must never surface');
+
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    const [entry] = listPointersForSession(sessionId);
+    assert.equal(entry.record.claimed, true, 'must be marked claimed once delivery is confirmed against the parent agent transcript');
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+});
+
+test('nested lane whose parent agent transcript is stale with no delivery — surfaced once in the session', () => {
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+
+  const parent = writePlainSubagent(subagentsDir, { name: 'deadparent', hash: 'dddd0001', toolUseId: 'toolu_DEADPARENT1' });
+  const child = writePlainSubagent(subagentsDir, {
+    name: 'orphanchild', hash: 'eeee0002', toolUseId: 'toolu_ORPHANCHILD1', parentAgentId: parent.agentId,
+  });
+
+  const dataDir = mkDataDir();
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    // The parent AGENT itself already finished — its own pointer exists
+    // under the same top-level session (exactly as the real SubagentStop
+    // hook would have written when the parent stopped). This alone must be
+    // enough for `isParentGone` to consider a nested pointer's parent gone,
+    // with no need to wait out the time-based grace period at all.
+    writePointer({
+      sessionId, agentId: parent.agentId, transcriptPath: parent.transcriptPath, agentName: null,
+      toolUseId: 'toolu_PARENT1', parentSessionId: sessionId, finishedAt: new Date().toISOString(), summary: 'parent finished',
+    });
+    assert.equal(isParentAgentFinished(sessionId, parent.agentId), true);
+
+    writePointer({
+      sessionId, agentId: child.agentId, transcriptPath: child.transcriptPath, agentName: null,
+      toolUseId: 'toolu_ORPHANCHILD1', parentSessionId: sessionId, parentAgentId: parent.agentId,
+      finishedAt: new Date().toISOString(), summary: 'orphaned nested child',
+    });
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  // Parent AGENT's own transcript has no delivery evidence for the child at
+  // all — this is the "stale, undelivered" case.
+  fs.writeFileSync(leadTranscriptPath, '', 'utf8');
+
+  // Unit-level check first: isParentGone must be true for the nested
+  // pointer purely because the parent agent already finished (well within
+  // the normal PARENT_GONE_GRACE_MS window — this is the OR branch, not the
+  // time-based one).
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    const [childEntry] = listPointersForSession(sessionId).filter((e) => e.agentId === child.agentId);
+    assert.equal(
+      isParentGone(childEntry, { currentSessionId: sessionId }),
+      true,
+      'a nested pointer whose parent agent already finished must be considered gone immediately',
+    );
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  // Integration: SessionStart, resuming the SAME session id, surfaces the
+  // orphaned nested child exactly once.
+  const first = runHook(SESSION_START_HOOK, { session_id: sessionId }, { dataDir });
+  const parsed = JSON.parse(first);
+  assert.equal(parsed.hookSpecificOutput.hookEventName, 'SessionStart');
+  assert.match(parsed.hookSpecificOutput.additionalContext, /orphaned nested child/);
+
+  const second = runHook(SESSION_START_HOOK, { session_id: sessionId }, { dataDir });
+  assert.equal(second.trim(), '', 'must not surface the same nested pointer twice via SessionStart');
+});
+
+test('a top-level spawn delivered to the session — never surfaced', () => {
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_TOPLEVEL1' });
+
+  const dataDir = mkDataDir();
+  const stopOut = runHook(SUBAGENT_STOP_HOOK, realSubagentStopPayload({
+    sessionId, leadTranscriptPath, agentTranscriptPath: transcriptPath, agentId, lastAssistantMessage: 'top-level report',
+  }), { dataDir });
+  assert.equal(stopOut.trim(), '');
+
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    const [entry] = listPointersForSession(sessionId);
+    assert.equal(entry.record.parentAgentId, null, 'a top-level dispatch must never carry a parentAgentId');
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  // Delivery lands directly on the TOP-LEVEL session transcript, as normal
+  // for a non-nested dispatch.
+  fs.writeFileSync(leadTranscriptPath, `${JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_TOPLEVEL1', content: 'done' }] },
+  })}\n`, 'utf8');
+
+  const upOut = runHook(USER_PROMPT_HOOK, { session_id: sessionId, transcript_path: leadTranscriptPath }, { dataDir });
+  assert.equal(upOut.trim(), '', 'a delivered top-level pointer must never surface');
 });
