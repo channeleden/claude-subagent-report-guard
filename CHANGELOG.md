@@ -3,18 +3,15 @@
 ## 2.0.4
 
 - Fixed a false "undelivered" report on a team-mailbox teammate whose
-  report WAS delivered via `SendMessage`. `wasDelivered()`
-  (`lib/orphan-pointers.js`) now also recognizes a team-mailbox delivery
-  relayed as a `type: "attachment"` / `attachment.type === "queued_command"`
-  entry carrying `<agent-message from="...">` (a real shape distinct from
-  the plain `type: "user"` string shape already covered), and independently
-  cross-checks the report-gate's OWN invocation log for a recorded
-  `outcome: "delivered"` for that exact agent id
-  (`wasDeliveredPerGateLog`) — immune to the transcript-timestamp guard
-  that can otherwise reject a same-SubagentStop-event delivery entry
-  timestamped a hair before a pointer's own `finishedAt` purely from
-  cross-process hook-ordering noise, not a genuinely older, unrelated
-  dispatch.
+  report WAS delivered via `SendMessage`. Delivery is now also confirmed
+  from the report-gate's OWN invocation log: a recorded
+  `outcome: "delivered"` for that exact agent id (`wasDeliveredPerGateLog`
+  in `lib/orphan-pointers.js`). That evidence is independent of the
+  transcript-timestamp guard, which rejected the real relay because the
+  pointer's `finishedAt` had been moved later by the misattribution fixed
+  below. A regression test now locks in that the existing transcript
+  matcher also handles the real `type: "attachment"` /
+  `attachment.type === "queued_command"` relay shape.
 - Fixed a real misattribution: a plain, non-team-mailbox agent's
   `SubagentStop` — whose own `agent_id` matched no team-mailbox candidate —
   could fall through `resolveTeammateContext`'s (`lib/report-gate.js`)
