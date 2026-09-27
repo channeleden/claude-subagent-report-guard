@@ -32,6 +32,8 @@ const {
   pointersDirFor,
   isParentGone,
   isParentAgentFinished,
+  wasDeliveredPerGateLog,
+  pointerIdentityConsistent,
 } = require('../lib/orphan-pointers.js');
 const { harnessAgentId } = require('../hooks/orphan-pointers-subagent-stop.js');
 
@@ -236,6 +238,43 @@ test('wasDelivered: team-mailbox agent-message delivery marker counts as deliver
   ]);
 
   const result = wasDelivered({ transcriptPath, agentName: 'triage', agentId: null, toolUseId: null });
+  assert.equal(result.delivered, true);
+});
+
+// Regression for a REAL, observed shape (2026-09-27 live session): a
+// team-mailbox teammate's message is relayed to the parent NOT as the plain
+// `type: "user"` string shape covered above, but as a `type: "attachment"`
+// entry whose `attachment.type === "queued_command"`, carrying the
+// `<agent-message from="...">` marker in its own `prompt` field (and in
+// `attachment.origin.from`/`origin.senderTaskId`). This exact shape,
+// wrapped as an advisory `isMeta: true` system-reminder to the dispatcher,
+// is what a real teammate's SendMessage delivery looked like on the wire —
+// `wasDelivered` must recognize it exactly like the plain-string shape.
+test('wasDelivered: team-mailbox agent-message delivered via a queued_command attachment (real relay shape) counts as delivered', () => {
+  const { subagentsDir } = mkSessionFixture();
+  const { transcriptPath } = writeTeamMailboxAgent(subagentsDir, { name: 'gate-live-test-3', hash: 'facade00cafe0003' });
+  const sessionDir = path.dirname(subagentsDir);
+  const parentPath = `${sessionDir}.jsonl`;
+  fs.writeFileSync(parentPath, '', 'utf8');
+  appendParentEntries(parentPath, [
+    {
+      type: 'attachment',
+      attachment: {
+        type: 'queued_command',
+        prompt: '<agent-message from="gate-live-test-3">\nreport body\n</agent-message>',
+        origin: {
+          kind: 'peer',
+          from: 'gate-live-test-3',
+          senderTaskId: 'agate-live-test-3-facade00cafe0003',
+          name: 'gate-live-test-3',
+          body: 'report body',
+        },
+        isMeta: true,
+      },
+    },
+  ]);
+
+  const result = wasDelivered({ transcriptPath, agentName: 'gate-live-test-3', agentId: null, toolUseId: null });
   assert.equal(result.delivered, true);
 });
 
@@ -450,6 +489,91 @@ test('wasDelivered: task-notification as a plain user-entry string (no attachmen
 
   const result = wasDelivered({ transcriptPath, agentName: null, agentId: 'afake0005', toolUseId: 'toolu_SPAWN4' });
   assert.equal(result.delivered, true);
+});
+
+// ── wasDeliveredPerGateLog: the report-gate's OWN "delivered" outcome ──
+//
+// Regression for a REAL, observed gap (2026-09-27 live session): the
+// report-gate's own invocation log recorded `outcome: "delivered"` for a
+// team-mailbox teammate at the exact SubagentStop firing that let it stop —
+// definitive, independent evidence of delivery — yet `wasDelivered`'s
+// transcript-only scan still reported "undelivered", because a SEPARATE
+// bug (fixed elsewhere in this release) had corrupted that pointer's own
+// `finishedAt` to a timestamp LATER than the parent transcript's real
+// relay entry, which `isTimestampAcceptable`'s guard then rejected as "too
+// early". The gate log check is immune to that: it is keyed by the
+// harness's own unique agent id, with no timestamp reasoning involved.
+
+function withGateLogPath(logPath, fn) {
+  const prev = process.env.SUBAGENT_REPORT_GUARD_LOG_PATH;
+  process.env.SUBAGENT_REPORT_GUARD_LOG_PATH = logPath;
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.SUBAGENT_REPORT_GUARD_LOG_PATH;
+    else process.env.SUBAGENT_REPORT_GUARD_LOG_PATH = prev;
+  }
+}
+
+function mkGateLog(lines) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orphan-ptr-gatelog-'));
+  const logPath = path.join(dir, 'report-gate-invocations.log');
+  fs.writeFileSync(logPath, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`, 'utf8');
+  return logPath;
+}
+
+test('wasDelivered: the gate\'s own "delivered" outcome counts as delivery even with a finishedAt that would reject the transcript evidence on timestamp grounds alone', () => {
+  const logPath = mkGateLog([
+    { ts: '2026-09-27T07:44:27.650Z', outcome: 'delivered', session_id: 'sess-gate', agent_id: 'agate-live-test-3-facade00cafe0003' },
+  ]);
+  withGateLogPath(logPath, () => {
+    const result = wasDelivered({
+      // No transcript file on disk at all — the gate log is the ONLY
+      // evidence available, and must be sufficient on its own.
+      transcriptPath: '/nonexistent/session/subagents/agent-agate-live-test-3-facade00cafe0003.jsonl',
+      agentId: 'agate-live-test-3-facade00cafe0003',
+      agentName: 'gate-live-test-3',
+      parentSessionId: 'sess-gate',
+      // Deliberately LATER than the gate log's own `ts` — the real
+      // corruption shape this closes (see the section header above).
+      finishedAt: '2026-09-27T07:53:41.881Z',
+    });
+    assert.equal(result.delivered, true);
+  });
+});
+
+test('wasDeliveredPerGateLog: a "block" outcome for the same agent does not count as delivered', () => {
+  const logPath = mkGateLog([
+    { ts: '2026-09-27T07:44:18.920Z', outcome: 'block', session_id: 'sess-gate', agent_id: 'agate-live-test-3-facade00cafe0003' },
+  ]);
+  withGateLogPath(logPath, () => {
+    assert.equal(wasDeliveredPerGateLog({ agentId: 'agate-live-test-3-facade00cafe0003', parentSessionId: 'sess-gate' }), false);
+  });
+});
+
+test('wasDeliveredPerGateLog: a "delivered" outcome for a DIFFERENT agent_id never counts for this pointer', () => {
+  const logPath = mkGateLog([
+    { ts: '2026-09-27T07:44:27.650Z', outcome: 'delivered', session_id: 'sess-gate', agent_id: 'a-some-other-agent-entirely' },
+  ]);
+  withGateLogPath(logPath, () => {
+    assert.equal(wasDeliveredPerGateLog({ agentId: 'agate-live-test-3-facade00cafe0003', parentSessionId: 'sess-gate' }), false);
+  });
+});
+
+test('wasDeliveredPerGateLog: a "delivered" outcome for the same agent_id but a DIFFERENT session_id never counts', () => {
+  const logPath = mkGateLog([
+    { ts: '2026-09-27T07:44:27.650Z', outcome: 'delivered', session_id: 'sess-other', agent_id: 'agate-live-test-3-facade00cafe0003' },
+  ]);
+  withGateLogPath(logPath, () => {
+    assert.equal(wasDeliveredPerGateLog({ agentId: 'agate-live-test-3-facade00cafe0003', parentSessionId: 'sess-gate' }), false);
+  });
+});
+
+test('wasDeliveredPerGateLog: no log file at all — false, never throws (fail open)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orphan-ptr-gatelog-empty-'));
+  withGateLogPath(path.join(dir, 'does-not-exist.log'), () => {
+    assert.equal(wasDeliveredPerGateLog({ agentId: 'a1', parentSessionId: 'sess-gate' }), false);
+  });
 });
 
 // ── harnessAgentId: derives the exact <task-id> string from a transcript path ──
