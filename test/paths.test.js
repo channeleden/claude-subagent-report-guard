@@ -39,17 +39,82 @@ test('dataDir(): CLAUDE_PLUGIN_DATA is used when no override is set', () => {
   }
 });
 
-test('dataDir(): falls back to ~/.claude/subagent-report-guard when nothing is set', () => {
+// Exercises the fallback branch against a FAKED HOME, never the real one —
+// see the "refuses to fall back to the real HOME under the test runner"
+// test below for why a real, un-isolated fallback call is not just
+// untested but actively refused.
+test('dataDir(): falls back to <HOME>/.claude/subagent-report-guard when nothing is set (faked HOME)', () => {
+  const prevOverride = process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  const prevPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  const prevHome = process.env.HOME;
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'paths-fallback-home-'));
+  delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  delete process.env.CLAUDE_PLUGIN_DATA;
+  process.env.HOME = fakeHome;
+  try {
+    const { dataDir } = freshPathsModule();
+    assert.equal(dataDir(), path.join(fakeHome, '.claude', 'subagent-report-guard'));
+  } finally {
+    if (prevOverride === undefined) delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR; else process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = prevOverride;
+    if (prevPluginData === undefined) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = prevPluginData;
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+  }
+});
+
+// ── dataDir(): the real-HOME test-isolation guard ────────────────────────
+//
+// Regression coverage for a real leak: a handful of lib/report-gate.js
+// tests called decide() directly with no SUBAGENT_REPORT_GUARD_DATA_DIR
+// override and no faked HOME, so dataDir()'s fallback branch resolved to
+// (and wrote real state files under) the operator's actual
+// ~/.claude/subagent-report-guard. dataDir() now refuses that combination
+// outright whenever node --test's own NODE_TEST_CONTEXT env var is set —
+// see lib/paths.js's own comment for why this can never fire outside a test
+// run. These tests run with the AMBIENT environment `node --test` already
+// gave this process (real NODE_TEST_CONTEXT, real un-faked HOME) — exactly
+// the historical leak condition — so a passing "throws" assertion here IS
+// the proof that condition can no longer write anywhere.
+test('dataDir(): refuses to fall back to the real HOME under the test runner (no override, no faked HOME)', () => {
+  assert.equal(typeof process.env.NODE_TEST_CONTEXT, 'string', 'this test only proves anything while actually running under node --test');
   const prevOverride = process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
   const prevPluginData = process.env.CLAUDE_PLUGIN_DATA;
   delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
   delete process.env.CLAUDE_PLUGIN_DATA;
   try {
     const { dataDir } = freshPathsModule();
-    assert.equal(dataDir(), path.join(os.homedir(), '.claude', 'subagent-report-guard'));
+    assert.throws(() => dataDir(), /refusing to fall back to the real home directory/);
   } finally {
     if (prevOverride === undefined) delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR; else process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = prevOverride;
     if (prevPluginData === undefined) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = prevPluginData;
+  }
+});
+
+test('dataDir(): the guard above does not fire once HOME is faked away from the real one', () => {
+  const prevOverride = process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  const prevPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  const prevHome = process.env.HOME;
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'paths-guard-home-'));
+  delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  delete process.env.CLAUDE_PLUGIN_DATA;
+  process.env.HOME = fakeHome;
+  try {
+    const { dataDir } = freshPathsModule();
+    assert.doesNotThrow(() => dataDir());
+  } finally {
+    if (prevOverride === undefined) delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR; else process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = prevOverride;
+    if (prevPluginData === undefined) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = prevPluginData;
+    if (prevHome === undefined) delete process.env.HOME; else process.env.HOME = prevHome;
+  }
+});
+
+test('dataDir(): the guard does not fire once SUBAGENT_REPORT_GUARD_DATA_DIR is set, even with a real HOME', () => {
+  const prevOverride = process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = '/tmp/some-override-dir';
+  try {
+    const { dataDir } = freshPathsModule();
+    assert.doesNotThrow(() => dataDir());
+  } finally {
+    if (prevOverride === undefined) delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR; else process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = prevOverride;
   }
 });
 

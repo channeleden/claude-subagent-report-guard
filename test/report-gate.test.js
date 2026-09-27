@@ -70,6 +70,27 @@ function mkDataDir() {
   return dir;
 }
 
+// Every direct (in-process) call into anything that resolves a data path
+// (decide()/evaluate() included — see statePathFor in lib/report-gate.js)
+// MUST run through this helper. Without it, dataDir()'s fallback would
+// resolve to (and write real state files under) the operator's actual
+// ~/.claude/subagent-report-guard — a real leak this repo has already hit
+// once from a handful of decide() calls that skipped isolation. lib/paths.js
+// now throws on that exact combination under the test runner (see
+// test/paths.test.js), so any FUTURE direct call added here without this
+// wrapper fails loudly instead of writing anywhere.
+function withDataDir(fn) {
+  const dataDir = mkDataDir();
+  const prevOverride = process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    return fn(dataDir);
+  } finally {
+    if (prevOverride === undefined) delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+    else process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = prevOverride;
+  }
+}
+
 function runHook(payload, { dataDir } = {}) {
   return execFileSync(process.execPath, [HOOK], {
     input: payload === null ? '' : JSON.stringify(payload),
@@ -359,7 +380,7 @@ test('classifyBackgroundSpawn: explicit run_in_background:false — contradicted
     name: 'sync-lane', hash: 'aaaa0001', lines: [assistantText('no SendMessage at all')],
     meta: { agentType: 'sync-lane', name: 'sync-lane', spawnDepth: 0, taskKind: 'in_process_teammate', toolUseId },
   });
-  const decision = decide({ transcript_path: leadTranscriptPath, agent_transcript_path: transcriptPath });
+  const decision = withDataDir(() => decide({ transcript_path: leadTranscriptPath, agent_transcript_path: transcriptPath }));
   assert.equal(decision, null, 'an explicitly foreground spawn must never be gated on SendMessage');
 });
 
@@ -370,7 +391,7 @@ test('classifyBackgroundSpawn: run_in_background absent (harness default) — st
     name: 'default-lane', hash: 'aaaa0002', lines: [assistantText('no SendMessage at all')],
     meta: { agentType: 'default-lane', name: 'default-lane', spawnDepth: 0, taskKind: 'in_process_teammate', toolUseId },
   });
-  const decision = decide({ transcript_path: leadTranscriptPath, agent_transcript_path: transcriptPath });
+  const decision = withDataDir(() => decide({ transcript_path: leadTranscriptPath, agent_transcript_path: transcriptPath }));
   assert.ok(decision, 'an ABSENT run_in_background flag is the harness default (background) and must not be read as a contradiction');
   assert.equal(decision.decision, 'block');
 });
@@ -382,7 +403,7 @@ test('classifyBackgroundSpawn: explicit run_in_background:true — confirmed, st
     name: 'bg-lane', hash: 'aaaa0003', lines: [assistantText('no SendMessage at all')],
     meta: { agentType: 'bg-lane', name: 'bg-lane', spawnDepth: 0, taskKind: 'in_process_teammate', toolUseId },
   });
-  const decision = decide({ transcript_path: leadTranscriptPath, agent_transcript_path: transcriptPath });
+  const decision = withDataDir(() => decide({ transcript_path: leadTranscriptPath, agent_transcript_path: transcriptPath }));
   assert.ok(decision);
   assert.equal(decision.decision, 'block');
 });
@@ -409,7 +430,7 @@ test('pending-followup: a follow-up delivered after the latest report blocks wit
       teammateMessage('actually also handle Y'), // arrives AFTER the report — makes it stale
     ],
   });
-  const decision = decide({ transcript_path: transcriptPath });
+  const decision = withDataDir(() => decide({ transcript_path: transcriptPath }));
   assert.ok(decision);
   assert.equal(decision.decision, 'block');
   assert.match(decision.reason, /follow-up arrived after your latest SendMessage/);
@@ -425,7 +446,7 @@ test('peer-ack-loop safety: a trailing SENDER-marked terminal ack after a real r
       teammateMessage('confirmed, holding [[terminal]]'), // sender-marked no-reply-needed
     ],
   });
-  const decision = decide({ transcript_path: transcriptPath });
+  const decision = withDataDir(() => decide({ transcript_path: transcriptPath }));
   assert.equal(decision, null, 'a sender-marked terminal ack must never itself re-trigger a block — that is the infinite peer-ack loop this closes');
 });
 
@@ -441,7 +462,7 @@ test('peer-ack-loop safety: WITHOUT the terminal marker, the same trailing ack D
       teammateMessage('any further plain message with no terminal marker'),
     ],
   });
-  const decision = decide({ transcript_path: transcriptPath });
+  const decision = withDataDir(() => decide({ transcript_path: transcriptPath }));
   assert.ok(decision, 'an un-marked trailing inbound message is correctly treated as an unaddressed follow-up');
   assert.equal(decision.decision, 'block');
 });
