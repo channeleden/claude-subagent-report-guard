@@ -26,6 +26,7 @@ const {
   formatPointerList,
   pointersRootDir,
   pruneOld,
+  pointerIdentityConsistent,
 } = require('../lib/orphan-pointers.js');
 const { isSafePathSegment } = require('../lib/path-safety.js');
 const { readStdinSync } = require('../lib/read-stdin.js');
@@ -62,6 +63,10 @@ function main() {
     const eligible = [];
     for (const entry of listAllPointers()) {
       if (entry.record.claimed) continue;
+      // Corrupt (misattributed) pointer — never surface its bogus summary.
+      // See lib/orphan-pointers.js's `pointerIdentityConsistent` doc
+      // comment for the real, observed corruption shape this backstops.
+      if (!pointerIdentityConsistent(entry.record, entry.agentId)) continue;
       // Computed once and threaded into `isParentGone` below (it needs the
       // same delivery evidence) rather than recomputed — `wasDelivered`
       // does a bounded tail-read of the parent transcript, and doing it

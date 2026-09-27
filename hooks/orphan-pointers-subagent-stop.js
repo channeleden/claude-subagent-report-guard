@@ -202,6 +202,25 @@ function main() {
 
     const { transcriptPath, meta } = resolved;
 
+    // Fail-closed identity-agreement guard, defense in depth beyond the
+    // fix to `lib/report-gate.js`'s `resolveTeammateContext` (see its own
+    // header for the real, observed bug this closes): when the payload
+    // asserts a specific stopping agent via `agent_id`, the transcript
+    // `resolveAnyAgentContext` actually resolved must be THAT agent's own —
+    // never a different one. A disagreement here means some resolution
+    // step (this one, or a future one) attributed this SubagentStop to the
+    // WRONG agent's transcript. Writing a pointer in that state is strictly
+    // worse than writing nothing: it keys a pointer under one agent's id
+    // (or name) while stamping it with a DIFFERENT agent's finishedAt and
+    // summary — exactly the observed misattribution (a plain subagent's
+    // stop event overwrote a named teammate's pointer with the wrong
+    // excerpt). Checked against the harness id derived straight from the
+    // RESOLVED transcript's own filename (see `harnessAgentId` below),
+    // never against `meta`/`resolved.agentId`, since the filename is the
+    // one thing that cannot itself have been swapped for the wrong agent's.
+    const payloadAgentId = nonEmptyString(payload.agent_id);
+    if (payloadAgentId && payloadAgentId !== harnessAgentId(transcriptPath)) return process.exit(0);
+
     // Prefer the harness-supplied top-level session id outright — no need
     // to re-derive it from a transcript path when the payload already
     // states it. Falls back to the old derivation (from the RESOLVED

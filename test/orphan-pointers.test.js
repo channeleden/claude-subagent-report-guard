@@ -654,6 +654,161 @@ test('SubagentStop hook: malformed/empty stdin never throws, never writes anythi
   assert.equal(out.trim(), '');
 });
 
+// ── regression: a second, unrelated agent's SubagentStop must never
+// overwrite or misattribute another agent's pointer (real, observed bug,
+// 2026-09-27 live session) ─────────────────────────────────────────────
+//
+// Real sequence: a named team-mailbox teammate (`gate-live-test-3`) got its
+// own pointer written correctly from its own SubagentStop firing. Roughly
+// nine minutes later, a COMPLETELY UNRELATED agent's SubagentStop fired
+// with its own `agent_id` (anonymized here as `adeadbeef00feed99`) — its
+// `agent_transcript_path` was present (`has_agent_transcript_path: true`
+// in the gate's own trace) but its sibling meta.json could not be read at
+// that moment (the real cause is unconfirmed — a race, or the file no
+// longer present — but the CONSEQUENCE was fully reproducible:
+// `resolveTeammateContext` fell through every exact-match step to the
+// session-wide recency heuristic, and — since the teammate was the ONLY
+// team-mailbox candidate in the session — resolved to the TEAMMATE's own
+// transcript. `hooks/orphan-pointers-subagent-stop.js` then wrote a
+// pointer keyed under the teammate's own agent id, but stamped with the
+// SECOND agent's `finishedAt` and `last_assistant_message` — corrupting an
+// already-correct, already-delivered pointer into a false "undelivered"
+// report with a completely wrong excerpt.
+//
+// Fixed at TWO layers, both exercised here: (1) `resolveTeammateContext`
+// (lib/report-gate.js) now returns null outright when the payload names an
+// explicit agent id that matches no team-mailbox candidate, rather than
+// falling through to the recency heuristic; (2) `hooks/orphan-pointers-
+// subagent-stop.js`'s own defense-in-depth guard fails closed (writes
+// nothing) whenever a resolved transcript's own filename-derived id
+// disagrees with the payload's asserted `agent_id`.
+test('SubagentStop hook: a second agent\'s SubagentStop, whose own transcript/meta cannot be read, never overwrites a DIFFERENT team-mailbox agent\'s pointer (real, observed misattribution regression)', () => {
+  const { sessionId, leadTranscriptPath, subagentsDir } = mkSessionFixture();
+
+  // The team-mailbox teammate — gets its own, correct pointer from its own
+  // SubagentStop firing first, exactly as it did live.
+  const teammate = writeTeamMailboxAgent(subagentsDir, { name: 'gate-live-test-3', hash: 'facade00cafe0003', text: 'gate test done' });
+  const dataDir = mkDataDir();
+  runHook(SUBAGENT_STOP_HOOK, realSubagentStopPayload({
+    sessionId, leadTranscriptPath, agentTranscriptPath: teammate.transcriptPath, agentId: teammate.agentId, lastAssistantMessage: 'gate test done',
+  }), { dataDir });
+
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  let teammateFinishedAtBefore;
+  try {
+    const [entry] = listPointersForSession(sessionId).filter((e) => e.agentId === teammate.agentId);
+    assert.ok(entry, 'the teammate pointer must exist after its own SubagentStop');
+    assert.equal(entry.record.summary, 'gate test done');
+    teammateFinishedAtBefore = entry.record.finishedAt;
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  // A SECOND, unrelated agent's SubagentStop fires with its own `agent_id`,
+  // but its own transcript/meta are never actually written to disk here —
+  // reproducing the real "sibling meta unreadable at resolution time"
+  // shape. The teammate remains the ONLY team-mailbox candidate in the
+  // session — exactly the shape that used to win the recency heuristic.
+  const missingAgentId = 'adeadbeef00feed99';
+  const missingTranscriptPath = path.join(subagentsDir, `agent-${missingAgentId}.jsonl`); // deliberately never written
+  runHook(SUBAGENT_STOP_HOOK, realSubagentStopPayload({
+    sessionId, leadTranscriptPath, agentTranscriptPath: missingTranscriptPath, agentId: missingAgentId,
+    lastAssistantMessage: 'a completely different, unrelated task',
+  }), { dataDir });
+
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    const entries = listPointersForSession(sessionId);
+    const teammateEntry = entries.find((e) => e.agentId === teammate.agentId);
+    assert.ok(teammateEntry, 'the teammate pointer must still exist');
+    assert.equal(teammateEntry.record.summary, 'gate test done', 'must NEVER be overwritten by an unrelated agent\'s stop event');
+    assert.equal(teammateEntry.record.finishedAt, teammateFinishedAtBefore, 'finishedAt must be untouched by the unrelated agent\'s stop');
+
+    // Fail-closed: since the second agent's own transcript/meta could not
+    // be resolved at all, no pointer is written for it either — never a
+    // pointer keyed under one agent's id but describing a different one's.
+    const missingEntry = entries.find((e) => e.agentId === missingAgentId);
+    assert.equal(missingEntry, undefined, 'an unresolvable agent must fail closed (write nothing), never contaminate another agent\'s pointer');
+    assert.equal(entries.length, 1, 'exactly one pointer must exist: the teammate\'s own, untouched');
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+});
+
+// ── pointerIdentityConsistent: read-side backstop for an ALREADY-corrupted
+// pointer (e.g. one written before the fix above shipped) — never surface
+// its summary, even once it would otherwise qualify ─────────────────────
+
+test('pointerIdentityConsistent: a pointer keyed under one agent but pointing at a DIFFERENT agent\'s transcript is flagged inconsistent', () => {
+  const record = { transcriptPath: '/x/session/subagents/agent-aother-deadbeef01.jsonl', agentId: 'agate-live-test-3-facade00cafe0003' };
+  assert.equal(pointerIdentityConsistent(record, 'agate-live-test-3-facade00cafe0003'), false);
+});
+
+test('pointerIdentityConsistent: a consistent pointer (storage key matches its own transcript\'s filename) passes', () => {
+  const record = { transcriptPath: '/x/session/subagents/agent-agate-live-test-3-facade00cafe0003.jsonl', agentId: 'agate-live-test-3-facade00cafe0003' };
+  assert.equal(pointerIdentityConsistent(record, 'agate-live-test-3-facade00cafe0003'), true);
+});
+
+test('pointerIdentityConsistent: an unmodeled transcript-path shape (doesn\'t match the agent-<id>.jsonl naming convention at all) never suppresses a legitimate pointer', () => {
+  const record = { transcriptPath: '/tmp/x/sess-1/some-other-shape.jsonl', agentId: 'agent-a1' };
+  assert.equal(pointerIdentityConsistent(record, 'agent-a1'), true);
+});
+
+test('UserPromptSubmit hook: a pre-existing corrupted pointer (agentId disagrees with its own transcript) is never surfaced, even past the grace period', () => {
+  const { subagentsDir } = mkSessionFixture();
+  // The REAL agent this pointer's transcript actually belongs to.
+  const { transcriptPath: realTranscriptPath } = writePlainSubagent(subagentsDir, { name: 'realagent', hash: 'cafef00d01', toolUseId: 'toolu_NEVER' });
+  const sessionDir = path.dirname(subagentsDir);
+  const sessionId = path.basename(sessionDir);
+  fs.writeFileSync(`${sessionDir}.jsonl`, '', 'utf8');
+
+  const dataDir = mkDataDir();
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    // Simulates a pointer left over from BEFORE this release's write-side
+    // fixes: stored under a DIFFERENT agent's key/name than the transcript
+    // it actually points at (real shape: `agate-live-test-3-...`'s key,
+    // `realagent`'s transcript).
+    writePointer({
+      sessionId, agentId: 'agate-live-test-3-facade00cafe0003', transcriptPath: realTranscriptPath,
+      agentName: 'gate-live-test-3', parentSessionId: sessionId,
+      finishedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(),
+      summary: 'bogus excerpt from a completely different agent',
+    });
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  const out = runHook(USER_PROMPT_HOOK, { session_id: sessionId, transcript_path: `${sessionDir}.jsonl` }, { dataDir });
+  assert.equal(out.trim(), '', 'a corrupted (misattributed) pointer must never be surfaced, even once it would otherwise qualify');
+});
+
+test('SessionStart hook: a pre-existing corrupted pointer (agentId disagrees with its own transcript) is never surfaced', () => {
+  const { subagentsDir } = mkSessionFixture();
+  const { transcriptPath: realTranscriptPath } = writePlainSubagent(subagentsDir, { name: 'realagent2', hash: 'cafef00d02', toolUseId: 'toolu_NEVER2' });
+  const sessionDir = path.dirname(subagentsDir);
+  const sessionId = path.basename(sessionDir);
+  const parentPath = `${sessionDir}.jsonl`;
+  fs.writeFileSync(parentPath, '', 'utf8');
+  const old = new Date(Date.now() - 60 * 60 * 1000);
+  fs.utimesSync(parentPath, old, old);
+
+  const dataDir = mkDataDir();
+  process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
+  try {
+    writePointer({
+      sessionId, agentId: 'agate-live-test-4-deadbeefcafe0001', transcriptPath: realTranscriptPath,
+      agentName: 'gate-live-test-4', parentSessionId: sessionId,
+      finishedAt: old.toISOString(), summary: 'bogus excerpt from a completely different agent',
+    });
+  } finally {
+    delete process.env.SUBAGENT_REPORT_GUARD_DATA_DIR;
+  }
+
+  const out = runHook(SESSION_START_HOOK, { session_id: 'a-totally-different-session' }, { dataDir });
+  assert.equal(out.trim(), '', 'a corrupted (misattributed) pointer must never be surfaced via SessionStart either');
+});
+
 // ── `agent_transcript_path` containment validation ──────────────────────
 //
 // Regression coverage for the fix closing a basename-pattern-only accept: a
@@ -773,7 +928,7 @@ test('end to end: background Agent spawn delivered via task-notification is neve
 
 test('UserPromptSubmit hook: a delivered pointer is marked claimed and never surfaced', () => {
   const { subagentsDir } = mkSessionFixture();
-  const { transcriptPath } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_DELIV1' });
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_DELIV1' });
   const sessionDir = path.dirname(subagentsDir);
   const sessionId = path.basename(sessionDir);
   fs.writeFileSync(`${sessionDir}.jsonl`, `${JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_DELIV1' }] } })}\n`, 'utf8');
@@ -781,8 +936,12 @@ test('UserPromptSubmit hook: a delivered pointer is marked claimed and never sur
   const dataDir = mkDataDir();
   process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
   try {
+    // agentId here must match transcriptPath's own filename-encoded id —
+    // see `pointerIdentityConsistent` in lib/orphan-pointers.js: a pointer
+    // whose storage key disagrees with its transcript's own filename is
+    // treated as corrupt and never surfaced, by design.
     writePointer({
-      sessionId, agentId: 'agent-adeliv1', transcriptPath, agentName: null, toolUseId: 'toolu_DELIV1',
+      sessionId, agentId, transcriptPath, agentName: null, toolUseId: 'toolu_DELIV1',
       parentSessionId: sessionId, finishedAt: new Date().toISOString(), summary: 'x',
     });
   } finally {
@@ -807,7 +966,7 @@ test('UserPromptSubmit hook: a delivered pointer is marked claimed and never sur
 
 test('UserPromptSubmit hook: surfaces an undelivered pointer once past the grace period, then never again (at-most-once)', () => {
   const { subagentsDir } = mkSessionFixture();
-  const { transcriptPath } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_UNDELIV1' });
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_UNDELIV1' });
   const sessionDir = path.dirname(subagentsDir);
   const sessionId = path.basename(sessionDir);
   fs.writeFileSync(`${sessionDir}.jsonl`, '', 'utf8');
@@ -816,7 +975,7 @@ test('UserPromptSubmit hook: surfaces an undelivered pointer once past the grace
   process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
   try {
     writePointer({
-      sessionId, agentId: 'agent-aundeliv1', transcriptPath, agentName: null,
+      sessionId, agentId, transcriptPath, agentName: null,
       // Well past the default 10-minute grace period — the top-level
       // surfacing gate must not hold this back any longer.
       parentSessionId: sessionId, finishedAt: new Date(Date.now() - 11 * 60 * 1000).toISOString(), summary: 'undelivered work',
@@ -1017,7 +1176,7 @@ test('SubagentStop hook: the writer path (a real, small transcript) stays well u
 
 test('SessionStart hook: a pointer from a dead prior session is surfaced once', () => {
   const { subagentsDir } = mkSessionFixture();
-  const { transcriptPath } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_DEAD1' });
+  const { transcriptPath, agentId } = writePlainSubagent(subagentsDir, { toolUseId: 'toolu_DEAD1' });
   const sessionDir = path.dirname(subagentsDir);
   const sessionId = path.basename(sessionDir);
   const parentPath = `${sessionDir}.jsonl`;
@@ -1030,7 +1189,7 @@ test('SessionStart hook: a pointer from a dead prior session is surfaced once', 
   process.env.SUBAGENT_REPORT_GUARD_DATA_DIR = dataDir;
   try {
     writePointer({
-      sessionId, agentId: 'agent-adead1', transcriptPath, agentName: null,
+      sessionId, agentId, transcriptPath, agentName: null,
       parentSessionId: sessionId, finishedAt: old.toISOString(), summary: 'orphaned from a dead session',
     });
   } finally {

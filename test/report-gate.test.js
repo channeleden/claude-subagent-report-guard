@@ -192,6 +192,32 @@ test('resolveTeammateContext: null (never gates) for a plain Task-tool subagent'
   assert.equal(resolveTeammateContext({ transcript_path: transcriptPath }), null);
 });
 
+// Regression for a REAL, observed misattribution (2026-09-27 live session):
+// a plain, non-team-mailbox subagent's SubagentStop fired with its own
+// `agent_id` present (and `agent_transcript_path` naming its own file,
+// which for this unit test is irrelevant — resolveTeammateContext is given
+// only `transcript_path` + `agent_id`, exactly the shape that used to slip
+// past step 3's exact match and fall to step 4). The ONLY team-mailbox
+// candidate under the session happened to be the freshest/only thing in the
+// recency window, so the old code wrongly resolved to IT instead of
+// returning null — misattributing a completely unrelated agent's stop event
+// to a named teammate's transcript. `resolveTeammateContext` must return
+// null here: the payload's own `agent_id` is positive evidence this is NOT
+// that teammate, and must never fall through to the recency heuristic.
+test('resolveTeammateContext: an agent_id that matches NO team-mailbox candidate returns null, never falls through to the recency heuristic', () => {
+  const { leadTranscriptPath, subagentsDir } = mkSessionFixture();
+  const now = Date.now();
+  // The one (and only) team-mailbox candidate in the session — freshest/only
+  // thing in the recency window, exactly the shape that used to win step 4.
+  writeTeammate(subagentsDir, { name: 'gate-live-test-3', hash: 'facade00cafe0003', lines: [assistantText('gate test done')], mtimeMs: now });
+
+  const resolved = resolveTeammateContext(
+    { transcript_path: leadTranscriptPath, agent_id: 'adeadbeef00feed99' },
+    { now },
+  );
+  assert.equal(resolved, null, 'an unmatched but explicit agent_id must never fall through to the recency heuristic');
+});
+
 test('EXACT_RESOLUTION_METHODS: the four exact steps — recency-heuristic is not one of them', () => {
   assert.deepEqual(
     [...EXACT_RESOLUTION_METHODS].sort(),
