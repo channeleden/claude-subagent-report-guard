@@ -1,5 +1,50 @@
 # Changelog
 
+## 2.0.4
+
+- Fixed a false "undelivered" report on a team-mailbox teammate whose
+  report WAS delivered via `SendMessage`. `wasDelivered()`
+  (`lib/orphan-pointers.js`) now also recognizes a team-mailbox delivery
+  relayed as a `type: "attachment"` / `attachment.type === "queued_command"`
+  entry carrying `<agent-message from="...">` (a real shape distinct from
+  the plain `type: "user"` string shape already covered), and independently
+  cross-checks the report-gate's OWN invocation log for a recorded
+  `outcome: "delivered"` for that exact agent id
+  (`wasDeliveredPerGateLog`) — immune to the transcript-timestamp guard
+  that can otherwise reject a same-SubagentStop-event delivery entry
+  timestamped a hair before a pointer's own `finishedAt` purely from
+  cross-process hook-ordering noise, not a genuinely older, unrelated
+  dispatch.
+- Fixed a real misattribution: a plain, non-team-mailbox agent's
+  `SubagentStop` — whose own `agent_id` matched no team-mailbox candidate —
+  could fall through `resolveTeammateContext`'s (`lib/report-gate.js`)
+  session-wide recency heuristic and resolve to an unrelated NAMED
+  teammate's transcript, purely because that teammate was the freshest (or
+  only) team-mailbox candidate at that instant. The resulting pointer was
+  then written under the teammate's own storage key but stamped with the
+  SECOND agent's `finishedAt` and final-message excerpt — a correct,
+  already-delivered pointer corrupted into a false "undelivered" report
+  with a completely wrong excerpt. `resolveTeammateContext` now returns
+  null outright whenever the payload names an explicit agent-identity field
+  that matches no team-mailbox candidate, rather than falling through to
+  the heuristic. `hooks/orphan-pointers-subagent-stop.js` also gained an
+  independent, defense-in-depth guard: it now fails closed (writes no
+  pointer at all) whenever a resolved transcript's own filename-derived
+  agent id disagrees with the payload's asserted `agent_id`. A read-side
+  backstop (`pointerIdentityConsistent`, used by both the `UserPromptSubmit`
+  and `SessionStart` surfacing hooks) also now refuses to ever surface a
+  pointer already on disk whose storage key disagrees with its own
+  `transcriptPath`'s filename-encoded agent id — covering any pointer
+  written before this fix shipped.
+- Added regression coverage for both fixes using anonymized real-shape
+  fixtures (`test/orphan-pointers.test.js`, `test/report-gate.test.js`):
+  the `queued_command` attachment relay shape, the gate-log delivered-state
+  check (including negative cases for a different outcome/agent/session),
+  an unmatched-`agent_id` case that must never fall through to the recency
+  heuristic, a second unrelated agent's `SubagentStop` that must never
+  overwrite or misattribute a different agent's existing pointer, and an
+  already-corrupted pointer that must never be surfaced by either hook.
+
 ## 2.0.3
 
 - Report gate invocation log (`<data dir>/logs/report-gate-invocations.log`)
