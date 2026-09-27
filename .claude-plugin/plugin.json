@@ -1,6 +1,6 @@
 {
   "name": "subagent-report-guard",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Blocks a dispatched Claude Code teammate from going idle without delivering its report, keeps a non-blocking drop-box of every lane's progress, and surfaces a pointer to any subagent report that never reached its dispatcher.",
   "author": {
     "name": "Channel Eden",
