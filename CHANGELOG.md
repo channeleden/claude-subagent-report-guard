@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.3
 
 - Report gate invocation log (`<data dir>/logs/report-gate-invocations.log`)
   is now privacy-minimal but far more diagnosable: every line carries
