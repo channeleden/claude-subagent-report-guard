@@ -23,6 +23,7 @@ const { maybeRun } = require('../lib/post-report-command.js');
 const { appendRotating } = require('../lib/log-rotation.js');
 const { subPath } = require('../lib/paths.js');
 const { readStdinSync } = require('../lib/read-stdin.js');
+const { writeUnreadInboxNotice } = require('../lib/orphan-pointers.js');
 
 const INVOCATION_LOG_PATH = process.env.SUBAGENT_REPORT_GUARD_LOG_PATH || subPath('logs', 'report-gate-invocations.log');
 
@@ -85,6 +86,33 @@ function readPayload() {
   }
 }
 
+// The outcome string for the invocation log. Existing values ('block' /
+// 'delivered' / 'allow' / 'not-team-mailbox-or-unresolvable') are preserved
+// exactly for backward compatibility with any existing log consumer; two
+// NEW values are added for the unread-inbox gate specifically (see
+// lib/report-gate.js's "UNREAD-INBOX GATE" header section):
+//   - 'block-unread-inbox' — the block fired, and the unread-inbox check
+//     was the ONLY reason (no report-delivery block also applied). When
+//     BOTH applied in the same call, the outcome stays the generic 'block'
+//     — the combined reason text (visible to the agent) already says both;
+//     this log line's `unread_count`/`inbox_outcome` fields still carry the
+//     unread-inbox half's own detail regardless.
+//   - 'allow-unread-inbox-already-blocked' — no block fired (the teammate
+//     is genuinely allowed to stop), but its inbox still has unread
+//     messages whose block-once marker was already claimed on an earlier
+//     stop. Never chosen over 'delivered' — a confirmed-delivered report is
+//     the more actionable signal for this log line, and drives
+//     `maybeRun` below regardless of which outcome string is logged.
+function outcomeFor(result) {
+  if (result.gateResult) {
+    if (result.inboxOutcome === 'block-unread-inbox' && !result.reportBlocked) return 'block-unread-inbox';
+    return 'block';
+  }
+  if (result.delivered) return 'delivered';
+  if (result.inboxOutcome === 'allow-unread-inbox-already-blocked') return 'allow-unread-inbox-already-blocked';
+  return 'allow';
+}
+
 function main() {
   const payload = readPayload();
   const result = payload ? evaluate(payload) : null;
@@ -105,11 +133,58 @@ function main() {
     return;
   }
 
-  if (result.delivered) {
+  const outcome = outcomeFor(result);
+  // `unread_count`/`inbox_outcome` are added to EVERY resolved log line
+  // (never message text — see this file's own "Privacy-minimal trace
+  // fields" note above `traceFields`; `lib/inbox-gate.js`'s
+  // `projectMessage` already bounds anything derived from a message to a
+  // <=200-char summary, and even that never reaches this log).
+  const inboxFields = { unread_count: result.unreadCount || 0, inbox_outcome: result.inboxOutcome || null };
+
+  if (result.gateResult) {
     logInvocation({
-      outcome: 'delivered',
+      outcome,
       ...trace,
       resolutionMethod: result.resolutionMethod || null,
+      ...inboxFields,
+    });
+    process.stdout.write(JSON.stringify(result.gateResult));
+    process.exit(0);
+    return;
+  }
+
+  // Surface to the LEAD: the teammate is stopping (allowed) despite its
+  // inbox still carrying unread messages, because the one-shot
+  // unread-inbox block already fired on an earlier stop and cannot fire
+  // again for this same set. Best-effort, never affects the gate's own
+  // decision — see lib/orphan-pointers.js's "Unread-inbox-at-stop notices"
+  // section for the surfacing side (hooks/orphan-pointers-user-prompt-submit.js).
+  if (result.inboxOutcome === 'allow-unread-inbox-already-blocked') {
+    try {
+      const payloadObj = payload && typeof payload === 'object' ? payload : {};
+      const sessionId = typeof payloadObj.session_id === 'string' ? payloadObj.session_id : null;
+      const agentId = result.agentId || trace.agent_id || null;
+      if (sessionId && agentId) {
+        writeUnreadInboxNotice({
+          sessionId,
+          agentId,
+          agentName: result.agentName || null,
+          unreadCount: result.unreadCount || 0,
+          messages: result.unreadMessages || [],
+          finishedAt: new Date().toISOString(),
+        });
+      }
+    } catch {
+      /* best-effort only; never affects the gate's decision */
+    }
+  }
+
+  if (result.delivered) {
+    logInvocation({
+      outcome,
+      ...trace,
+      resolutionMethod: result.resolutionMethod || null,
+      ...inboxFields,
     });
     try {
       maybeRun(result.transcriptPath, { agentId: result.agentId || '' });
@@ -120,25 +195,15 @@ function main() {
     return;
   }
 
-  if (result.gateResult) {
-    logInvocation({
-      outcome: 'block',
-      ...trace,
-      resolutionMethod: result.resolutionMethod || null,
-    });
-    process.stdout.write(JSON.stringify(result.gateResult));
-    process.exit(0);
-    return;
-  }
-
   logInvocation({
-    outcome: 'allow',
+    outcome,
     ...trace,
     resolutionMethod: result.resolutionMethod || null,
+    ...inboxFields,
   });
   process.exit(0);
 }
 
 if (require.main === module) main();
 
-module.exports = { main, traceFields };
+module.exports = { main, traceFields, outcomeFor };

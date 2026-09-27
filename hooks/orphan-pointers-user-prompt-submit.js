@@ -31,10 +31,14 @@ const {
   hasAnyPointers,
   reconcileAndFilter,
   markSurfaced,
+  isSurfaceMarked,
   formatPointerList,
   pointersRootDir,
   claimPointersDeliveredByPrompt,
   isEligibleForUserPromptSubmitSurfacing,
+  hasAnyUnreadInboxNotices,
+  listUnreadInboxNoticesForSession,
+  formatUnreadInboxNotice,
 } = require('../lib/orphan-pointers.js');
 const { subagentSessionDir } = require('../lib/subagent-transcript.js');
 const { isSafePathSegment } = require('../lib/path-safety.js');
@@ -70,7 +74,9 @@ function sessionIdFromPayload(payload) {
 
 function main() {
   try {
-    if (!hasAnyPointers()) return process.exit(0); // empty case: no transcript reads at all
+    const anyPointers = hasAnyPointers();
+    const anyUnreadNotices = hasAnyUnreadInboxNotices();
+    if (!anyPointers && !anyUnreadNotices) return process.exit(0); // empty case: no transcript reads at all
 
     const payload = readPayload();
     const sessionId = sessionIdFromPayload(payload);
@@ -87,9 +93,20 @@ function main() {
     claimPointersDeliveredByPrompt(sessionId, prompt);
 
     const now = Date.now();
-    const reconciled = reconcileAndFilter(sessionId, 'userPromptSubmit', { now });
+    const reconciled = anyPointers ? reconcileAndFilter(sessionId, 'userPromptSubmit', { now }) : [];
     const eligible = reconciled.filter((entry) => isEligibleForUserPromptSubmitSurfacing(entry, { now }));
-    if (!eligible.length) return process.exit(0);
+
+    // Unread-inbox-at-stop notices — see lib/orphan-pointers.js's own
+    // "Unread-inbox-at-stop notices for the LEAD" section. Surfaced once
+    // per notice, via the exact same atomic `markSurfaced`/`isSurfaceMarked`
+    // mechanism a delivery pointer uses, with no eligibility time-gate (the
+    // notice is only ever written once the teammate has ALREADY stopped —
+    // there is no "still in flight" race to wait out, unlike a pointer).
+    const unreadNotices = anyUnreadNotices
+      ? listUnreadInboxNoticesForSession(sessionId).filter((entry) => !isSurfaceMarked(entry, 'userPromptSubmit'))
+      : [];
+
+    if (!eligible.length && !unreadNotices.length) return process.exit(0);
 
     // `markSurfaced` returns true only for the entries THIS process actually
     // claimed (wins an atomic wx-created marker file) — a concurrent
@@ -97,14 +114,23 @@ function main() {
     // the claim and is filtered out here, so the same pointer is never
     // surfaced twice.
     const claimed = eligible.filter((entry) => markSurfaced(entry, 'userPromptSubmit'));
-    if (!claimed.length) return process.exit(0);
+    const claimedUnread = unreadNotices.filter((entry) => markSurfaced(entry, 'userPromptSubmit'));
+    if (!claimed.length && !claimedUnread.length) return process.exit(0);
 
-    const additionalContext =
-      `${claimed.length} subagent report${claimed.length === 1 ? '' : 's'} from this session may not have reached you ` +
-      `(normal delivery could not be confirmed):\n${formatPointerList(claimed, pointersRootDir())}`;
+    const sections = [];
+    if (claimed.length) {
+      sections.push(
+        `${claimed.length} subagent report${claimed.length === 1 ? '' : 's'} from this session may not have reached you ` +
+        `(normal delivery could not be confirmed):\n${formatPointerList(claimed, pointersRootDir())}`,
+      );
+    }
+    if (claimedUnread.length) {
+      const lines = claimedUnread.map((entry) => `- ${formatUnreadInboxNotice(entry)}`).join('\n');
+      sections.push(`${claimedUnread.length} teammate stop${claimedUnread.length === 1 ? '' : 's'} left unread inbox messages:\n${lines}`);
+    }
 
     process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext },
+      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: sections.join('\n\n') },
     }));
   } catch {
     /* fail open, unconditionally */

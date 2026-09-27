@@ -1,5 +1,53 @@
 # Changelog
 
+## 2.0.5
+
+- Fixed the "unread-message drop": a lead can `SendMessage` a teammate
+  while that teammate is on its final turn. `SendMessage` reports success
+  ("queued for next tool round"), but if the teammate ends its turn with no
+  further tool round, the message is never drained — the teammate's idle
+  notification says "nothing further", and the follow-up was silently
+  lost, even though it durably sits, unread, in the teammate's own team
+  inbox file on disk. The `SubagentStop` gate now also checks that inbox
+  (`<teams root>/<teamName>/inboxes/<name>.json` — Claude Code's own real,
+  live layout, read-only, resolved via the new `lib/inbox-gate.js` +
+  `teamsRootDir()` in `lib/paths.js`) and blocks once per distinct unread
+  set (`lib/report-gate.js`'s `computeUnreadInboxOutcome`), forcing the
+  extra turn that drains it. Bounded exactly like the existing
+  missing-report block: a hash of the sorted unread `msg_id`s is claimed
+  through the same atomic per-agent marker mechanism, so the same set never
+  re-blocks and a genuinely new message blocks once more. Composes with the
+  missing-report block into a single `gateResult` (both reasons present)
+  when both apply in the same stop, with each side's one-shot bookkeeping
+  staying independent.
+- When the one-shot unread-inbox block has already fired and a teammate
+  stops anyway with messages still unread, a notice is now recorded for the
+  LEAD and surfaced once on its next prompt (reusing
+  `lib/orphan-pointers.js`'s existing atomic surfaced-once marker
+  mechanism, via `hooks/orphan-pointers-user-prompt-submit.js`) — e.g.
+  "teammate `<name>` stopped with 1 unread message(s) from `team-lead`:
+  `<summary>` — re-send or follow up".
+- Verified read-only against a live inbox file
+  (`~/.claude/teams/<session>/inboxes/<name>.json`): the harness's `read`
+  field never transitions to `true` in real data (dozens of inbox files
+  spanning months, every message still `"read": false`) — this is itself
+  the root-cause evidence for the fix above, and the reason the gate is
+  keyed on a hash of the unread `msg_id` set rather than on `read`
+  transitioning. `isReadTrue()` in `lib/inbox-gate.js` also defensively
+  accepts the strings `"true"`/`"True"` (and therefore treats
+  `"false"`/`"False"` as unread too), though the real data never emits
+  anything but a JSON boolean.
+- Investigated whether a PLAIN (unnamed) subagent has an equivalent
+  observable inbox to gate on: it does not. A plain Task-tool subagent has
+  no `taskKind: "in_process_teammate"` sidecar, no `name`/`teamName` fields
+  to resolve a team inbox path from, and no `SendMessage`-based mailbox at
+  all — its result is returned as a synchronous `tool_result` or a
+  background task-notification, not queued mail. Out of scope for this
+  fix; documented in the README.
+- New env var `SUBAGENT_REPORT_GUARD_TEAMS_ROOT` (default `~/.claude/teams`)
+  and matching `{ "teamsRoot": "..." }` config.json key, mirroring the
+  existing `dropboxRoot` override shape.
+
 ## 2.0.4
 
 - Fixed a false "undelivered" report on a team-mailbox teammate whose

@@ -156,6 +156,68 @@ Read a lane's file directly (`tail`, `jq`, or the module's own
 `readLaneRecords()`) any time you want to check in on it — no database, no
 queue.
 
+### Unread-inbox gate — the details
+
+A SEPARATE problem from the report-delivery gate above: a lead can
+`SendMessage` a teammate while that teammate is on its FINAL turn.
+`SendMessage` reports success ("queued for next tool round"), but if the
+teammate ends its turn with no further tool round, that message is never
+drained — the teammate's own idle notification says "nothing further", and
+the message is effectively lost from the teammate's point of view for the
+rest of the session, even though it durably sits, unread, in the
+teammate's own team inbox file on disk
+(`<teams root>/<teamName>/inboxes/<name>.json` — Claude Code's own real,
+live per-session layout, resolved via `teamsRootDir()` in `lib/paths.js`;
+this plugin only ever READS that directory, never writes to it).
+
+On every `SubagentStop`, `lib/report-gate.js`'s `computeUnreadInboxOutcome`
+(fed by `lib/inbox-gate.js`) checks that teammate's own inbox for any
+unread message and, if any exist, blocks the stop — independent of, and
+composed with, the report-delivery check above (a teammate can have sent a
+perfectly well-formed report and still have an unrelated unread message
+sitting in its inbox; both are checked on every stop). Bounded exactly like
+the report-delivery block: a hash of the sorted unread `msg_id` set is
+claimed once through the same atomic per-agent marker mechanism, in the
+same state dir — the identical unread set never re-blocks, but a genuinely
+new unread message (a new hash) blocks once more. When both the
+report-delivery block and the unread-inbox block apply on the same stop,
+exactly one `gateResult` is emitted with both reasons present; each side's
+own one-shot bookkeeping stays independent.
+
+**Surfacing to the lead.** The teammate only gets ONE forced extra turn per
+distinct unread set — if it stops again anyway (e.g. it read the inbox but
+chose not to act, or a second stop races the first), a small notice is
+recorded for the LEAD and surfaced once on the lead's next prompt, reusing
+`lib/orphan-pointers.js`'s existing atomic surfaced-once marker mechanism
+(`hooks/orphan-pointers-user-prompt-submit.js`): "teammate `<name>` stopped
+with `N` unread message(s) from `<senders>`: `<summaries>` — re-send or
+follow up". **Operating rule this implies:** to redirect an agent that is
+finishing its final turn, stop it first (`TaskStop`) and dispatch a fresh
+one — don't send a follow-up `SendMessage` to an agent that is already
+wrapping up; it may never see it before this plugin's one-shot block is
+used up.
+
+**Plain (unnamed) subagents are out of scope, deliberately.** A plain
+Task-tool subagent (no `taskKind: "in_process_teammate")` sidecar) has no
+`name`/`teamName` to resolve a team inbox path from, and no
+`SendMessage`-based mailbox at all — its result is returned as a
+synchronous `tool_result` or a background task-notification, never queued
+mail sitting in an inbox file. There is no equivalent observable inbox for
+this mechanism to check.
+
+Real shape (verified read-only against a live inbox file, reduced to an
+anonymized fixture under `test/fixtures/real-shape-2026-09-27/` before
+being committed to this public repo): a JSON array of `{ from, msgV,
+msg_id, read, summary, text, timestamp, type }`. `read` is a JSON boolean
+in the real data — and, notably, every message observed live (dozens of
+inbox files, some months old) still carried `"read": false"`; no `true`
+value was ever observed. That absence is itself the evidence for this
+mechanism's design: nothing in the real system ever flips this flag, so
+the gate is keyed on a hash of the unread `msg_id` set, never on waiting
+for `read` to become `true`. `isReadTrue()` also defensively accepts the
+strings `"true"`/`"True"` (and therefore `"false"`/`"False"`), though the
+real data never emits anything but a JSON boolean.
+
 ### Orphaned-report pointers — the details
 
 **Normal delivery is untouched.** When the parent session is alive, Claude
@@ -272,6 +334,8 @@ Everything is optional; every default is sensible with zero configuration.
 | `SUBAGENT_REPORT_GUARD_PARENT_GONE_GRACE_MS` | `600000` (10 min) | `lib/orphan-pointers.js` | Grace period before a quiet parent transcript is treated as a dead/prior session for cross-session pointer surfacing; also the minimum time a same-session TOP-LEVEL pointer must stay undelivered before `UserPromptSubmit` will ever surface it. |
 | `SUBAGENT_REPORT_GUARD_NESTED_SETTLE_MS` | `30000` (30 s) | `lib/orphan-pointers.js` | Minimum time a NESTED pointer (spawned by another subagent) must stay finished before `UserPromptSubmit` will surface it, even once its parent agent is already gone — avoids racing an in-flight notification to a parent agent that just stopped. |
 | `SUBAGENT_REPORT_GUARD_DROPBOX_ROOT` | unset | `lib/paths.js` | Same effect as `{ "dropboxRoot": "~/some/path" }` in `<data dir>/config.json`; the env var wins if both are set. See the `dropboxRoot` details below. |
+| `SUBAGENT_REPORT_GUARD_TEAMS_ROOT` | `~/.claude/teams` | `lib/paths.js` | Where Claude Code's own real, live per-session team-mailbox layout lives (`<root>/<teamName>/inboxes/<name>.json`) — READ-ONLY, never written by this plugin. Same effect as `{ "teamsRoot": "~/some/path" }` in `<data dir>/config.json`; the env var wins if both are set. Test-only in practice — a real install should not need to override this. |
+| `SUBAGENT_REPORT_GUARD_INBOX_MAX_BYTES` | `2097152` (2 MB) | `lib/inbox-gate.js` | Size cap on a team inbox file the unread-inbox gate will read; a larger file is skipped outright (treated as "no unread messages"), never partially parsed. |
 | `SUBAGENT_REPORT_GUARD_DATA_DIR` | unset | `lib/paths.js` | Override this plugin's data dir entirely. **Test-only** — used by this repo's own tests; a real install should not need it. |
 | `CLAUDE_PLUGIN_DATA` | unset | `lib/paths.js` | Set by the Claude Code harness itself (not this plugin) on builds that support it; used as the data dir when `SUBAGENT_REPORT_GUARD_DATA_DIR` is unset. |
 | `LANE_DROPBOX_CLAIM_EMITTER_PATH` | resolves to `lib/claim-emitter.js` next to `lane-dropbox.js` | `lib/lane-dropbox.js` | **Test-only** seam for overriding the optional claim-emitter module path in tests; a real install should not need it. |
@@ -308,12 +372,22 @@ by `lib/paths.js`:
    installed version** — this plugin works correctly either way), else
 3. `~/.claude/subagent-report-guard/`.
 
-Documented children of that one directory: `report-gate-state/`,
-`post-report-command/`, `pointers/<sessionId>/<agentId>.json`,
+Documented children of that one directory: `report-gate-state/` (also
+holds the unread-inbox gate's own one-shot markers, alongside the
+report-delivery ones), `post-report-command/`,
+`pointers/<sessionId>/<agentId>.json`,
+`unread-inbox-notices/<sessionId>/<agentId>.json` (the unread-inbox gate's
+lead-facing notices — see "Unread-inbox gate — the details" above),
 `teams/<session_id>/dropbox/` + `teams/<session_id>/.state/` (the lane
 drop-box — see the `dropboxRoot` option above for redirecting this
 specific subtree elsewhere), and `logs/report-gate-invocations.log` (+ its
 `.1` rotation).
+
+**Not a child of this directory:** `~/.claude/teams/` — Claude Code's own
+real team-mailbox layout, which the unread-inbox gate reads (never writes)
+via `SUBAGENT_REPORT_GUARD_TEAMS_ROOT` (default `~/.claude/teams`, see the
+Configuration table above). This is a live directory owned by the harness
+itself, not by this plugin, and is untouched by uninstall below.
 
 With **default configuration and zero setup**, this is exhaustive: nothing
 this plugin ever writes lands anywhere else.

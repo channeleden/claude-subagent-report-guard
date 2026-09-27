@@ -1,0 +1,12 @@
+[
+  {
+    "from": "team-lead",
+    "text": "Correction to my brief for work item 1 — do not write that scope is under review, because that set is empty. Update your notes and continue with the rest as written.",
+    "summary": "Correct my brief: item 1 has no open scope",
+    "timestamp": "2026-09-27T08:03:58.325Z",
+    "msgV": 1,
+    "msg_id": "00000000-0000-4000-8000-000000000001",
+    "type": "message",
+    "read": false
+  }
+]
