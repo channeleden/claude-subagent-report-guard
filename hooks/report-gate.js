@@ -17,12 +17,12 @@
  * `decision` field on stdout only. Every failure mode fails open.
  */
 
-const fs = require('fs');
 const path = require('path');
 const { evaluate } = require('../lib/report-gate.js');
 const { maybeRun } = require('../lib/post-report-command.js');
 const { appendRotating } = require('../lib/log-rotation.js');
 const { subPath } = require('../lib/paths.js');
+const { readStdinSync } = require('../lib/read-stdin.js');
 
 const INVOCATION_LOG_PATH = process.env.SUBAGENT_REPORT_GUARD_LOG_PATH || subPath('logs', 'report-gate-invocations.log');
 
@@ -34,9 +34,13 @@ function logInvocation(fields) {
   }
 }
 
+// See lib/read-stdin.js for why this is not a direct fs.readFileSync call —
+// a naive single-shot stdin read is reliable on macOS but can throw EAGAIN
+// on Linux, which this catch would otherwise silently mistake for "no
+// payload" (a real Linux-CI-only failure mode, not theoretical).
 function readPayload() {
   try {
-    const raw = fs.readFileSync('/dev/stdin', 'utf8').trim();
+    const raw = readStdinSync().trim();
     if (!raw) return null;
     return JSON.parse(raw);
   } catch {

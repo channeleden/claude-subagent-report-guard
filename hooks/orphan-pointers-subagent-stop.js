@@ -23,10 +23,15 @@ const {
 const { resolveTeammateContext } = require('../lib/report-gate.js');
 const { writePointer } = require('../lib/orphan-pointers.js');
 const { isSafePathSegment } = require('../lib/path-safety.js');
+const { readStdinSync } = require('../lib/read-stdin.js');
 
+// See lib/read-stdin.js for why this is not a direct fs.readFileSync call —
+// a naive single-shot stdin read is reliable on macOS but can throw EAGAIN
+// on Linux, which this catch would otherwise silently mistake for "no
+// payload" (a real Linux-CI-only failure mode, not theoretical).
 function readPayload() {
   try {
-    const raw = fs.readFileSync('/dev/stdin', 'utf8').trim();
+    const raw = readStdinSync().trim();
     if (!raw) return null;
     return JSON.parse(raw);
   } catch {
