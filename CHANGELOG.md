@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Rewrote `README.md` for a public, first-time-installer audience (was
+  written for the maintainer's own workspace): what problem this solves,
+  install/uninstall, a concrete before/after, requirements, a
+  troubleshooting section, and every configuration variable, without the
+  internal incident narratives and full log-schema detail that made the
+  prior version 25KB. No behavior change; a portability audit of the code
+  found no workspace-specific assumptions to fix (the plugin already
+  resolves its data dir portably via `lib/paths.js`, ships a hashed
+  private-vocabulary hygiene scanner, and has no dependency on any
+  external tooling — see `scripts/hygiene-check.js` and
+  `test/uninstall.test.js`).
+
 ## 2.0.4
 
 - Fixed a false "undelivered" report on a team-mailbox teammate whose
