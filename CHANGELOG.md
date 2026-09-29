@@ -14,6 +14,26 @@
   external tooling — see `scripts/hygiene-check.js` and
   `test/uninstall.test.js`).
 
+## Unreleased
+
+- Rewrote the README for a public audience: problem statement, install, what
+  each hook does, configuration, troubleshooting, and a substantially expanded
+  **Known limitations** section.
+- Corrected and expanded the upstream issue citations, with states verified
+  2026-09-29 (#74113 closed, #76500 open, #26426 closed, #24108 closed) and the
+  file-backed-inbox render/turn-injection mechanism described explicitly.
+- Documented a confirmed gap: because 2.0.4 accepts the plugin's own invocation
+  log as delivery evidence, a report the recipient never rendered can be marked
+  delivered, suppressing the orphan-report path. Observed live 2026-09-28 —
+  `SendMessage` returned success, the inbox drained, and no message envelope
+  reached the parent transcript. Sender-side evidence should lower confidence,
+  never satisfy it; the fix is in progress on a public branch.
+- Documented that an agent interrupted mid-task is not distinguished from one
+  that finished without delivering, so a recovered pointer may hold narration
+  rather than a report.
+- Portability audit found no defects: no hardcoded paths, no personal
+  identifiers, no dependency on the author's workspace. Docs-only change.
+
 ## 2.0.4
 
 - Fixed a false "undelivered" report on a team-mailbox teammate whose

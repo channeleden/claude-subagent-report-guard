@@ -3,6 +3,15 @@
 A Claude Code plugin that stops dispatched subagents from going idle
 without delivering their final report to whoever dispatched them.
 
+## Status
+
+Actively maintained. Two known gaps are being worked on in the open — a
+delivered-looking report that was never actually read, and an interrupted agent
+being indistinguishable from an undelivered one. Both are described in
+[Known limitations](#known-limitations), and work in progress is pushed to a
+public branch rather than held back. If you are evaluating this plugin, read that
+section first.
+
 ## The problem
 
 When you dispatch a Claude Code teammate (a background "team-mailbox"
@@ -13,13 +22,32 @@ calling `SendMessage`, the dispatcher receives only a content-free idle
 notification. The report exists, if at all, only in that teammate's own
 transcript file on disk, and by default nothing tells you it's stuck there.
 
-This is a reproduced, tracked gap in the harness itself:
+This is a reproduced gap in the harness itself, tracked upstream. Issue states
+below were checked on 2026-09-29; a closed issue does not always mean the
+behavior is gone in the version you are running.
 
-- [anthropics/claude-code#74113](https://github.com/anthropics/claude-code/issues/74113)
-  — background agents frequently go idle without delivering their final
-  `SendMessage` report.
-- [anthropics/claude-code#76500](https://github.com/anthropics/claude-code/issues/76500)
-  — Agent Teams mailbox turn-boundary delays and lost final reports.
+- [#74113](https://github.com/anthropics/claude-code/issues/74113) (closed) —
+  *"Background agents frequently go idle without delivering their final
+  SendMessage report (re-ping recovers it)."*
+- [#76500](https://github.com/anthropics/claude-code/issues/76500) (open) —
+  *"Agent Teams mailbox: 5-62 min turn-boundary delays, lost final reports
+  (idle_notification arrives instead), /clear queue leak, shutdown handshake
+  never completes."*
+- [#26426](https://github.com/anthropics/claude-code/issues/26426) (closed) —
+  *"Agent Teams inbox polling doesn't work in non-interactive/SDK streaming
+  mode."*
+- [#24108](https://github.com/anthropics/claude-code/issues/24108) (closed) —
+  *"Agent teams: teammates stuck at idle prompt in tmux split-pane mode
+  (mailbox never polled)."*
+
+The mechanism behind these matters for understanding what this plugin can and
+cannot do. The teammate inbox is **file-backed** at
+`~/.claude/teams/<session>/inboxes/<agent>.json`. A message can be written
+there, drained from the file, and still never be rendered into the recipient's
+transcript turn — so **the failure is the render/turn-injection step, not
+transport.** A sender can receive `{"success": true}` for a message the
+recipient will never see. That step is inside the harness and is not something
+a plugin can fix; everything here is mitigation and recovery.
 
 **This plugin is Claude-Code-specific by nature.** It depends on the exact
 hook events, on-disk transcript layout, and JSONL shapes this harness
@@ -185,18 +213,73 @@ every hook against a scratch `HOME` and asserting nothing lands outside it.
 
 ## Known limitations
 
-- The recency-based identity fallback (reached only when no exact step
-  matches) is a heuristic, not a certainty — see `lib/report-gate.js`'s
-  header for the full four-step order and its accepted residual.
-- The orphaned-pointer delivery check is real-evidence-based but not
-  exhaustive: a future harness change to any recognized marker shape could
-  make a genuinely-delivered report look undelivered (surfaced once,
-  redundantly — noisy but harmless) or, in principle, the reverse.
-- Neither mechanism fixes the underlying platform behavior described in the
-  linked issues — these are user-side mitigations, not upstream fixes.
-- `CLAUDE_PLUGIN_DATA` support is unconfirmed on every Claude Code version;
-  the `~/.claude/subagent-report-guard/` fallback is exercised by every
-  test in this repo either way.
+Read this section before relying on the plugin. These are real, and two of them
+are actively being worked on.
+
+### The root cause is upstream and not fixable here
+
+The render/turn-injection failure described in "The problem" happens inside the
+harness. This plugin cannot make a message render. Everything it provides is
+mitigation — force a resend, capture durably, surface later. If your reports are
+going missing, this plugin improves your odds of recovering them; it does not
+stop the underlying behavior.
+
+### A delivered-looking report may not have been read (confirmed, being fixed)
+
+Since 2.0.4, delivery is confirmed partly from the plugin's **own invocation
+log** — a recorded `outcome: "delivered"` for that agent. That is **sender-side**
+evidence: it proves the agent called `SendMessage` successfully, not that the
+recipient ever rendered it.
+
+Observed on a live session 2026-09-28: three teammates each got
+`{"success": true}` from `SendMessage`. One addressed `main` and its report
+appeared in the parent transcript three times. Two addressed the session's lead
+agent by name; their inbox files drained to `[]` and **no message envelope ever
+appeared in the parent transcript.** All three pointers were marked delivered, so
+the orphan-report path never surfaced anything, and roughly 23,000 characters of
+completed analysis sat unread until it was recovered by hand from the subagents'
+own transcripts.
+
+The fix is to require receiver-side evidence before treating a pointer as
+delivered, letting sender-side evidence lower confidence but never satisfy it.
+Until that lands, **treat "no orphan report surfaced" as weak assurance**, and if
+a dispatched agent's result never appears, check
+`~/.claude/subagent-report-guard/pointers/<session>/` and the agent's own
+transcript directly.
+
+### `main` and a named lead agent behaved differently
+
+In the same session, `SendMessage` to `main` rendered into the parent transcript
+while sends to the lead agent's teammate name did not — both being valid
+addresses. This is observed, not explained. Addressing `main` from a background
+agent is the more reliable choice meanwhile.
+
+### An interrupted agent looks like an undelivered report
+
+A pointer records the agent's final assistant text whatever that text is. An
+agent killed mid-task leaves something like *"Now making the edits…"* — 87
+characters of narration, not a report. The plugin does not currently distinguish
+*interrupted* from *finished but undelivered*, so a recovered pointer may contain
+no report at all.
+
+### Identity resolution has an accepted residual
+
+The recency-based identity fallback — reached only when no exact step matches —
+is a heuristic. See `lib/report-gate.js`'s header for the four-step order and
+its accepted residual.
+
+### Marker shapes are version-coupled
+
+The orphaned-pointer delivery check matches specific envelope shapes. A harness
+change to any of them could make a delivered report look undelivered (surfaced
+redundantly — noisy but harmless) or, as described above, the reverse.
+
+### Environment
+
+`CLAUDE_PLUGIN_DATA` support is unconfirmed across every Claude Code version;
+the `~/.claude/subagent-report-guard/` fallback is exercised by every test in
+this repo either way. The plugin is Claude-Code-specific by nature — it depends
+on this harness's hook events, on-disk transcript layout and JSONL shapes.
 
 ## Tests
 
